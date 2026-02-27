@@ -37,18 +37,21 @@ Note:
 - `Batch: year folders only`
 - `Batch: live debug log (file)`
 
-## Installation (Load Unpacked)
-1. Open `chrome://extensions`.
-2. Enable `Developer mode`.
-3. Click `Load unpacked`.
-4. Select this project directory.
+## How to Install
+1. Download this project (ZIP) from GitHub.
+2. Extract it to a local folder.
+3. Open `chrome://extensions`.
+4. Enable `Developer mode`.
+5. Click `Load unpacked`.
+6. Select the extracted folder.
 
 ## Usage
-1. Open `https://chatgpt.com/`.
-2. Pin the extension in the toolbar.
-3. Open popup and run `Save` or `Save Batch`.
-4. Keep the ChatGPT tab in the foreground during batch export.
-5. Do not interact with the page while batch export is running.
+1. Pin the extension in the Chrome toolbar.
+2. Open a ChatGPT thread at `https://chatgpt.com/c/...`.
+3. Refresh the page once after loading the extension.
+4. Open the extension popup and run `Save` or `Save Batch`.
+5. During batch export, keep the ChatGPT window/tab in the foreground.
+6. Do not click, scroll, or switch tabs while batch export is running.
 
 ## Important Batch Note
 Batch export can run for a long time, especially with large histories.
