@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="de">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -9,22 +9,22 @@
 <body>
   <main class="popup">
     <h1>ChatGPT Export</h1>
-    <p id="hint" class="hint">Pruefe aktiven Tab...</p>
+    <p id="hint" class="hint">Checking active tab...</p>
 
     <label class="toggle top">
       <input id="yearFolderToggle" type="checkbox">
-      <span>Batch: nur Jahresordner</span>
+      <span>Batch: year folders only</span>
     </label>
     <label class="toggle top">
       <input id="debugLogToggle" type="checkbox">
-      <span>Batch: Debug-Log live (Datei)</span>
+      <span>Batch: live debug log (file)</span>
     </label>
 
     <div class="actions">
-      <button id="exportBtn" type="button">Speichern</button>
-      <button id="batchBtn" type="button" class="secondary">Batch speichern</button>
-      <button id="resumeBatchBtn" type="button" class="secondary">Batch fortsetzen</button>
-      <button id="cancelBatchBtn" type="button" class="danger">Export stoppen</button>
+      <button id="exportBtn" type="button">Save</button>
+      <button id="batchBtn" type="button" class="secondary">Save Batch</button>
+      <button id="resumeBatchBtn" type="button" class="secondary">Resume Batch</button>
+      <button id="cancelBatchBtn" type="button" class="danger">Stop Export</button>
     </div>
 
     <p class="meta">Batch saves to: Chat GPT/Account/Year/Month (optional year-only). Hold this tab in foreground and do nothing while batch export is running; it can take a long, long time.</p>

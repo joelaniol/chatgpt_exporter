@@ -8,7 +8,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const conflictAction = normalizeConflictAction(message.conflictAction);
 
   if (!html) {
-    sendResponse({ ok: false, error: "Leerer Export-Inhalt." });
+    sendResponse({ ok: false, error: "Empty export content." });
     return false;
   }
 
@@ -26,12 +26,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       if (runtimeError) {
         sendResponse({
           ok: false,
-          error: runtimeError.message || "Download fehlgeschlagen"
+          error: runtimeError.message || "Download failed"
         });
         return;
       }
       if (typeof downloadId !== "number") {
-        sendResponse({ ok: false, error: "Download konnte nicht gestartet werden" });
+        sendResponse({ ok: false, error: "Download could not be started" });
         return;
       }
       sendResponse({ ok: true, downloadId });

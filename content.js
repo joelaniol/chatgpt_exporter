@@ -1,4 +1,4 @@
-(function initChatGptThreadExporter() {
+﻿(function initChatGptThreadExporter() {
   if (window.top !== window) {
     return;
   }
@@ -172,7 +172,7 @@
       void refreshInlineTimestamps(wantsStatus).catch((error) => {
         console.error("[ChatGPT Export] Inline refresh crashed:", error);
         if (wantsStatus) {
-          setStatus("Inline-Zeitstempel Fehler, bitte neu laden.", "error", 4200);
+          setStatus("Inline timestamp error, please reload.", "error", 4200);
         }
       });
     }, 50);
@@ -186,7 +186,7 @@
 
     renderInlineTimestampBadges();
     if (showStatus) {
-      setStatus("Inline-Zeitstempel aktualisiert.", "success", 2600);
+      setStatus("Inline timestamps refreshed.", "success", 2600);
     }
   }
 
@@ -345,18 +345,18 @@
         sendResponse({
           ok: false,
           showInlineTimestamps: false,
-          error: "Echtzeit-Zeitstempel im Thread sind deaktiviert."
+          error: "Real-time inline timestamps in thread are disabled."
         });
         return false;
       }
 
       if (type === "chatgpt-export-trigger") {
         if (isExporting) {
-          sendResponse({ ok: false, error: "Export laeuft bereits." });
+          sendResponse({ ok: false, error: "Export is already running." });
           return false;
         }
         if (!isConversationPage()) {
-          sendResponse({ ok: false, error: "Bitte einen Chat-Thread (/c/...) oeffnen." });
+          sendResponse({ ok: false, error: "Please open a chat thread (/c/...)." });
           return false;
         }
         void startExport("action").catch((error) => {
@@ -368,7 +368,7 @@
 
       if (type === "chatgpt-export-batch-trigger") {
         if (isExporting) {
-          sendResponse({ ok: false, error: "Export laeuft bereits." });
+          sendResponse({ ok: false, error: "Export is already running." });
           return false;
         }
         void startBatchExport("action", message?.options || {}).catch((error) => {
@@ -380,7 +380,7 @@
 
       if (type === "chatgpt-export-batch-resume-trigger") {
         if (isExporting) {
-          sendResponse({ ok: false, error: "Export laeuft bereits." });
+          sendResponse({ ok: false, error: "Export is already running." });
           return false;
         }
         void resumeBatchExport("action").catch((error) => {
@@ -534,12 +534,12 @@
 
   async function startExport(triggerSource) {
     if (isExporting) {
-      setStatus("Export laeuft bereits...", "busy", 2400);
+      setStatus("Export is already running...", "busy", 2400);
       return;
     }
 
     if (!isConversationPage()) {
-      setStatus("Bitte oeffne zuerst einen Chat-Thread.", "error", 7000);
+      setStatus("Please open a chat thread first.", "error", 7000);
       return;
     }
 
@@ -548,7 +548,7 @@
     setExportLifecycleActive("single");
 
     try {
-      setStatus("Export startet...", "busy");
+      setStatus("Starting export...", "busy");
 
       const fallbackTitle = getConversationTitleFromPage();
       const exportResult = await collectMessages(setStatus, {
@@ -557,7 +557,7 @@
       });
 
       if (!Array.isArray(exportResult.messages) || exportResult.messages.length === 0) {
-        throw new Error("Keine exportierbaren Nachrichten gefunden.");
+        throw new Error("No exportable messages found.");
       }
 
       const finalTitle = exportResult.conversationTitle || fallbackTitle;
@@ -576,24 +576,24 @@
 
       const fileName = buildFileName(finalTitle, threadStartedAt);
 
-      setStatus("Datei wird heruntergeladen...", "busy");
+      setStatus("Downloading file...", "busy");
       await triggerBrowserDownload(html, fileName, {
         subdirectory: EXPORT_BASE_FOLDER_NAME
       });
 
       const sourceLabel = "DOM";
       setStatus(
-        "Gespeichert: " + fileName + " (" + sourceLabel + ", " + preparedMessages.length + " Nachrichten)",
+        "Saved: " + fileName + " (" + sourceLabel + ", " + preparedMessages.length + " Messages)",
         "success",
         9000
       );
     } catch (error) {
       if (isExportCancelledError(error)) {
-        setStatus("Export gestoppt.", "success", 5000);
+        setStatus("Export stopped.", "success", 5000);
         return;
       }
       console.error("[ChatGPT Export] Export failed:", error);
-      setStatus("Fehler beim Export: " + (error?.message || String(error)), "error", 12000);
+      setStatus("Export error: " + (error?.message || String(error)), "error", 12000);
       throw error;
     } finally {
       isExporting = false;
@@ -609,14 +609,14 @@
   async function startBatchExport(triggerSource, options = {}) {
     void triggerSource;
     if (isExporting) {
-      setStatus("Export laeuft bereits...", "busy", 2400);
+      setStatus("Export is already running...", "busy", 2400);
       return;
     }
 
     const savedBatchState = loadBatchState();
     if (hasResumableBatchState(savedBatchState)) {
       const shouldResume = window.confirm(
-        "Es gibt einen unterbrochenen Batch.\nOK = fortsetzen\nAbbrechen = neu starten"
+        "A paused batch was found.\nOK = resume\nCancel = start new"
       );
       if (shouldResume) {
         await startBatchExportFromState(savedBatchState, "resume");
@@ -636,14 +636,14 @@
     };
 
     try {
-      reportStatus("Batch: Lade Thread-Liste...", "busy");
+      reportStatus("Batch: Loading thread list...", "busy");
 
       const firstPayload = await fetchConversationListPage(0, BATCH_LIST_PAGE_LIMIT, reportStatus);
       let firstPage = normalizeConversationListPage(firstPayload, 0, BATCH_LIST_PAGE_LIMIT);
       if (!firstPage.items || firstPage.items.length === 0) {
         const domFallbackItems = collectConversationMetasFromVisibleLinks();
         if (domFallbackItems.length > 0) {
-          reportStatus("Batch: API-Liste leer, nutze sichtbare Thread-Links...", "busy");
+          reportStatus("Batch: API list empty, using visible thread links...", "busy");
           firstPage = {
             items: domFallbackItems,
             total: domFallbackItems.length,
@@ -654,11 +654,11 @@
           const topLevelKeys = (firstPayload && typeof firstPayload === "object")
             ? Object.keys(firstPayload).slice(0, 12)
             : [];
-          console.warn("[ChatGPT Export] Thread-Liste leer oder unbekanntes API-Format.", {
+          console.warn("[ChatGPT Export] Thread list empty or unknown API format.", {
             payloadType: typeof firstPayload,
             topLevelKeys
           });
-          throw new Error("Keine Threads gefunden.");
+          throw new Error("No threads found.");
         }
       }
 
@@ -672,15 +672,15 @@
       }
 
       if (requestedCount == null) {
-        reportStatus("Batch abgebrochen.", "success", 3200);
+        reportStatus("Batch cancelled.", "success", 3200);
         return;
       }
 
-      reportStatus("Batch: Sammle Thread-Liste...", "busy");
+      reportStatus("Batch: Collecting thread list...", "busy");
       const metaResult = await collectConversationMetasForBatch(requestedCount, firstPage, reportStatus);
       const items = Array.isArray(metaResult?.items) ? metaResult.items : [];
       if (items.length === 0) {
-        throw new Error("Keine Threads fuer Batch gefunden.");
+        throw new Error("No threads found for batch export.");
       }
 
       const state = initializeBatchState(items, batchOptions);
@@ -691,25 +691,25 @@
       console.error("[ChatGPT Export] Batch start crashed:", error);
       if (error?.code === "sidebar_hidden_timeout") {
         setStatus(
-          "Batch-Start pausiert: Sidebar konnte im Hintergrund nicht zuverlaessig nachladen. Bitte ChatGPT-Tab im Vordergrund halten und erneut starten.",
+          "Batch start paused: sidebar could not reliably load in background. Keep the ChatGPT tab in the foreground and start again.",
           "error",
           14000
         );
         return;
       }
-      setStatus("Batch-Export Fehler: " + (error?.message || String(error)), "error", 12000);
+      setStatus("Batch export error: " + (error?.message || String(error)), "error", 12000);
     }
   }
 
   async function resumeBatchExport(triggerSource) {
     void triggerSource;
     if (isExporting) {
-      setStatus("Export laeuft bereits...", "busy", 2400);
+      setStatus("Export is already running...", "busy", 2400);
       return;
     }
     const savedState = loadBatchState();
     if (!hasResumableBatchState(savedState)) {
-      setStatus("Kein pausierter Batch gefunden.", "error", 5000);
+      setStatus("No paused batch found.", "error", 5000);
       return;
     }
     await startBatchExportFromState(savedState, "resume");
@@ -719,7 +719,7 @@
     void source;
     const normalizedState = normalizeStoredBatchState(savedState);
     if (!hasResumableBatchState(normalizedState)) {
-      setStatus("Kein fortsetzbarer Batch vorhanden.", "error", 5000);
+      setStatus("No resumable batch available.", "error", 5000);
       return;
     }
     await runBatchExportState(normalizedState);
@@ -727,10 +727,10 @@
 
   async function runBatchExportState(state) {
     if (!state || !Array.isArray(state.items) || state.items.length === 0) {
-      throw new Error("Ungueltiger Batch-Status.");
+      throw new Error("Invalid batch state.");
     }
     if (isExporting) {
-      setStatus("Export laeuft bereits...", "busy", 2400);
+      setStatus("Export is already running...", "busy", 2400);
       return;
     }
 
@@ -759,7 +759,7 @@
       appendBatchDebugEvent(context, {
         level: "info",
         code: "batch_started",
-        message: "Batch gestartet.",
+        message: "Batch started.",
         position: Math.max(1, Number(state.nextIndex) + 1 || 1),
         extra: {
           totalCount,
@@ -794,7 +794,7 @@
           appendBatchDebugEvent(context, {
             level: "warn",
             code: "batch_paused_hidden_tab",
-            message: "Batch pausiert: ChatGPT-Tab war zu lange im Hintergrund.",
+            message: "Batch paused: ChatGPT tab stayed in background too long.",
             position,
             meta
           });
@@ -806,17 +806,17 @@
         }
         try {
           const doneBefore = getBatchCompletedCount(state, totalCount);
-          const safeTitle = sanitizeConversationTitle(meta?.title || "") || "Ohne Titel";
+          const safeTitle = sanitizeConversationTitle(meta?.title || "") || "Untitled";
           appendBatchDebugEvent(context, {
             level: "info",
             code: "thread_started",
-            message: "Thread wird exportiert.",
+            message: "Exporting thread.",
             position,
             meta
           });
           setStatus(
             "Batch " + indexLabel + " | " + doneBefore + "/" + totalCount +
-            " abgeschlossen: Lade \"" + shortenTitle(safeTitle, 52) + "\"...",
+            " completed: Loading \"" + shortenTitle(safeTitle, 52) + "\"...",
             "busy"
           );
           let abortedCurrentItem = false;
@@ -828,7 +828,7 @@
             appendBatchDebugEvent(context, {
               level: "info",
               code: "thread_exported",
-              message: "Thread gespeichert.",
+              message: "Thread saved.",
               position,
               meta,
               extra: {
@@ -839,21 +839,21 @@
             const doneAfter = getBatchCompletedCount(state, totalCount);
             setStatus(
               "Batch " + indexLabel + " | " + doneAfter + "/" + totalCount +
-              " abgeschlossen: Gespeichert \"" + shortenTitle(exportResult.fileName, 56) + "\" (" + exportResult.source + ")",
+              " completed: Saved \"" + shortenTitle(exportResult.fileName, 56) + "\" (" + exportResult.source + ")",
               "success"
             );
           } catch (error) {
             if (isExportCancelledError(error)) {
               context.cancelRequested = true;
               abortedCurrentItem = true;
-              setStatus("Stopp angefordert. Export wird pausiert...", "busy");
+              setStatus("Stop requested. Export will pause...", "busy");
             } else if (isConversationNotFoundError(error)) {
               failureKind = "not_found";
               state.skippedCount += 1;
               const doneAfter = getBatchCompletedCount(state, totalCount);
               setStatus(
                 "Batch " + indexLabel + " | " + doneAfter + "/" + totalCount +
-                " abgeschlossen: Thread nicht gefunden (404).",
+                " completed: Thread not found (404).",
                 "error"
               );
             } else {
@@ -862,7 +862,7 @@
               const doneAfter = getBatchCompletedCount(state, totalCount);
               setStatus(
                 "Batch " + indexLabel + " | " + doneAfter + "/" + totalCount +
-                " abgeschlossen: Fehler: " + (error?.message || String(error)),
+                " completed: Error: " + (error?.message || String(error)),
                 "error"
               );
             }
@@ -878,7 +878,7 @@
               appendBatchDebugEvent(context, {
                 level: "error",
                 code: "thread_failed",
-                message: "Thread fehlgeschlagen.",
+                message: "Thread failed.",
                 position,
                 meta,
                 failure: failureEntry
@@ -930,20 +930,20 @@
             meta,
             position,
             kind: "internal_iteration_error",
-            error: "[interner-batch-schritt] " + errorMessage
+            error: "[internal-batch-step] " + errorMessage
           });
           state.failures.push(failureEntry);
           appendBatchDebugEvent(context, {
             level: "error",
             code: "internal_iteration_error",
-            message: "Interner Batch-Schritt fehlgeschlagen.",
+            message: "Internal batch step failed.",
             position,
             meta,
             failure: failureEntry
           });
           setStatus(
             "Batch " + indexLabel + " | " + doneAfter + "/" + totalCount +
-            " abgeschlossen: Interner Fehler, fahre mit naechstem Thread fort: " + errorMessage,
+            " completed: Internal error, continuing with next thread: " + errorMessage,
             "error"
           );
 
@@ -966,18 +966,18 @@
         const pausedByHiddenTab = context.pauseReason === "hidden_tab_timeout";
         const pauseMessage = pausedByHiddenTab
           ? (
-            "Batch pausiert bei " + state.nextIndex + "/" + totalCount +
-            ": ChatGPT-Tab war zu lange im Hintergrund. Tab sichtbar machen und mit 'Batch fortsetzen' weiter."
+            "Batch paused at " + state.nextIndex + "/" + totalCount +
+            ": ChatGPT tab stayed in the background too long. Make the tab visible and continue with 'Resume Batch'."
           )
           : (
-            "Batch pausiert bei " + state.nextIndex + "/" + totalCount + ". Mit 'Batch fortsetzen' weiter."
+            "Batch paused at " + state.nextIndex + "/" + totalCount + ". Continue with 'Resume Batch'."
           );
         appendBatchDebugEvent(context, {
           level: "warn",
           code: "batch_paused",
           message: pausedByHiddenTab
-            ? "Batch pausiert (Tab zu lange im Hintergrund)."
-            : "Batch pausiert (Stop angefordert).",
+            ? "Batch paused (tab too long in background)."
+            : "Batch paused (stop requested).",
           position: Math.max(0, Number(state.nextIndex) || 0)
         });
         await maybeFlushBatchDebugLog(context, {
@@ -997,17 +997,17 @@
       saveBatchState(state);
 
       let finalMessage =
-        "Batch fertig: " +
+        "Batch finished: " +
         state.successCount +
-        " gespeichert, " +
+        " saved, " +
         state.failureCount +
-        " Fehler, " +
+        " errors, " +
         state.skippedCount +
-        " uebersprungen.";
+        " skipped.";
       let failureReportFileName = "";
 
       if (state.failures.length > 0) {
-        console.warn("[ChatGPT Export] Batch-Fehler:", state.failures);
+        console.warn("[ChatGPT Export] Batch failures:", state.failures);
         try {
           failureReportFileName = await createAndDownloadBatchFailureReport({
             state,
@@ -1016,14 +1016,14 @@
             usedFileNames
           });
         } catch (reportError) {
-          console.error("[ChatGPT Export] Fehlerbericht konnte nicht gespeichert werden:", reportError);
+          console.error("[ChatGPT Export] Failure report could not be saved:", reportError);
         }
       }
 
       appendBatchDebugEvent(context, {
         level: state.failureCount > 0 ? "warn" : "info",
         code: "batch_completed",
-        message: "Batch abgeschlossen.",
+        message: "Batch completed.",
         position: totalCount,
         extra: {
           successCount: state.successCount,
@@ -1038,7 +1038,7 @@
       });
 
       if (failureReportFileName) {
-        finalMessage += " Fehlerbericht: " + failureReportFileName + ".";
+        finalMessage += " Failure report: " + failureReportFileName + ".";
       }
 
       setStatus(finalMessage, state.failureCount > 0 ? "error" : "success", 16000);
@@ -1052,7 +1052,7 @@
         appendBatchDebugEvent(context, {
           level: "warn",
           code: "batch_paused",
-          message: "Batch pausiert (Cancel Exception).",
+          message: "Batch paused (cancel exception).",
           position: Math.max(0, Number(state.nextIndex) || 0)
         });
         await maybeFlushBatchDebugLog(context, {
@@ -1060,7 +1060,7 @@
           trigger: "batch_paused_cancel_error"
         });
         setStatus(
-          "Batch pausiert bei " + state.nextIndex + "/" + totalCount + ". Mit 'Batch fortsetzen' weiter.",
+          "Batch paused at " + state.nextIndex + "/" + totalCount + ". Continue with 'Resume Batch'.",
           "success",
           10000
         );
@@ -1073,7 +1073,7 @@
       appendBatchDebugEvent(context, {
         level: "error",
         code: "batch_crashed",
-        message: "Batch-Export abgestuerzt.",
+        message: "Batch export crashed.",
         position: Math.max(0, Number(state.nextIndex) || 0),
         extra: {
           error: error?.message || String(error)
@@ -1083,7 +1083,7 @@
         force: true,
         trigger: "batch_crashed"
       });
-      setStatus("Batch-Export Fehler: " + (error?.message || String(error)), "error", 12000);
+      setStatus("Batch export error: " + (error?.message || String(error)), "error", 12000);
     } finally {
       context.running = false;
       if (batchRunContext === context) {
@@ -1098,7 +1098,7 @@
   async function exportConversationForBatch(meta, position, totalCount, context) {
     const indexLabel = position + "/" + totalCount;
     const doneBefore = getBatchCompletedCount(context?.state, totalCount);
-    const progressLabel = doneBefore + "/" + totalCount + " abgeschlossen";
+    const progressLabel = doneBefore + "/" + totalCount + " completed";
     const options = context?.state?.options || {};
 
     try {
@@ -1110,7 +1110,7 @@
 
       const messages = extractMessagesFromApiPayload(payload);
       if (!Array.isArray(messages) || messages.length === 0) {
-        throw new Error("Keine Nachrichten im Thread.");
+        throw new Error("No messages in thread.");
       }
 
       return await createAndDownloadBatchHtml({
@@ -1150,7 +1150,7 @@
     const doneBefore = getBatchCompletedCount(context?.state, totalCount);
     setStatus(
       "Batch " + position + "/" + totalCount + " | " + doneBefore + "/" + totalCount +
-      " abgeschlossen: API langsam, DOM-Fallback aktiv...",
+      " completed: API is slow, using DOM fallback...",
       "busy"
     );
 
@@ -1184,7 +1184,7 @@
     const doneBefore = getBatchCompletedCount(context?.state, totalCount);
     setStatus(
       "Batch " + position + "/" + totalCount + " | " + doneBefore + "/" + totalCount +
-      " abgeschlossen: oeffne Thread fuer DOM-Export...",
+      " completed: opening thread for DOM export...",
       "busy"
     );
 
@@ -1257,7 +1257,7 @@
       }
 
       if (typeof progressCallback === "function") {
-        progressCallback("Batch: Thread-Route wurde noch nicht aktiv, erneuter Navigationsversuch...", "busy");
+        progressCallback("Batch: thread route is not active yet, retrying navigation...", "busy");
       }
       await sleep(220 + Math.floor(Math.random() * 180));
     }
@@ -1415,7 +1415,7 @@
       exportedAt
     });
     const reportFileName = uniquifyFileName(
-      "Batch_Fehlerbericht_" + formatDateForFileName(exportedAt) + ".html",
+      "Batch_Failure_Report_" + formatDateForFileName(exportedAt) + ".html",
       usedFileNames instanceof Set ? usedFileNames : new Set()
     );
     const folderPath = buildBatchFolderPath({
@@ -1440,8 +1440,8 @@
 
     const normalizedFailures = failures.map((item, idx) => {
       const id = String(item?.id || "").trim();
-      const title = sanitizeConversationTitle(item?.title || "") || "Ohne Titel";
-      const error = String(item?.error || "").trim() || "Unbekannter Fehler";
+      const title = sanitizeConversationTitle(item?.title || "") || "Untitled";
+      const error = String(item?.error || "").trim() || "Unknown error";
       const position = Number(item?.position);
       const positionLabel = Number.isFinite(position) && position > 0
         ? (String(position) + "/" + (total > 0 ? String(total) : "?"))
@@ -1453,7 +1453,7 @@
       const atMs = Number(item?.at);
       const atLabel = Number.isFinite(atMs) && atMs > 0
         ? formatTimestamp(new Date(atMs))
-        : "Zeit unbekannt";
+        : "Unknown time";
       const threadUrl = id ? (baseUrl + "/c/" + encodeURIComponent(id)) : "";
 
       return {
@@ -1521,11 +1521,11 @@
     }).join("\n");
 
     return `<!DOCTYPE html>
-<html lang="de">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Batch Fehlerbericht</title>
+  <title>Batch Failure Report</title>
   <style>
     :root { color-scheme: light; }
     body {
@@ -1597,19 +1597,19 @@
 <body>
   <main class="card">
     <section class="head">
-      <h1>Batch Fehlerbericht</h1>
-      <p><strong>Exportiert:</strong> <time datetime="${escapeHtml(exportedIso)}">${escapeHtml(exportedLabel)}</time></p>
-      <p><strong>Gesamt:</strong> ${total} | <strong>Gespeichert:</strong> ${success} | <strong>Fehler:</strong> ${failure} | <strong>Uebersprungen:</strong> ${skipped}</p>
-      <p><strong>Eintraege im Bericht:</strong> ${normalizedFailures.length}</p>
+      <h1>Batch Failure Report</h1>
+      <p><strong>Exported:</strong> <time datetime="${escapeHtml(exportedIso)}">${escapeHtml(exportedLabel)}</time></p>
+      <p><strong>Total:</strong> ${total} | <strong>Saved:</strong> ${success} | <strong>Errors:</strong> ${failure} | <strong>Skipped:</strong> ${skipped}</p>
+      <p><strong>Entries in report:</strong> ${normalizedFailures.length}</p>
     </section>
     <section>
-      <h2>Fehler nach Grund</h2>
+      <h2>Errors by reason</h2>
       <div class="table-wrap">
         <table class="reason-table">
           <thead>
             <tr>
               <th>Reason Code</th>
-              <th>Anzahl</th>
+              <th>Count</th>
             </tr>
           </thead>
           <tbody>
@@ -1619,18 +1619,18 @@ ${reasonRows}
       </div>
     </section>
     <section class="table-wrap">
-      <h2>Uebersicht</h2>
+      <h2>Overview</h2>
       <table>
         <thead>
           <tr>
             <th>#</th>
             <th>Position</th>
-            <th>Typ</th>
+            <th>Type</th>
             <th>Reason Code</th>
             <th>Reason</th>
-            <th>Thread-ID</th>
-            <th>Titel</th>
-            <th>Fehler</th>
+            <th>Conversation ID</th>
+            <th>Title</th>
+            <th>Error</th>
           </tr>
         </thead>
         <tbody>
@@ -1639,19 +1639,19 @@ ${rows}
       </table>
     </section>
     <section class="table-wrap">
-      <h2>Diagnose-Log</h2>
+      <h2>Diagnostic log</h2>
       <table>
         <thead>
           <tr>
             <th>#</th>
-            <th>Zeit</th>
+            <th>Time</th>
             <th>Position</th>
-            <th>Titel</th>
-            <th>Thread-ID</th>
+            <th>Title</th>
+            <th>Conversation ID</th>
             <th>Reason Code</th>
             <th>Reason</th>
-            <th>Thread-Link</th>
-            <th>Rohfehler</th>
+            <th>Thread link</th>
+            <th>Raw error</th>
           </tr>
         </thead>
         <tbody>
@@ -1667,12 +1667,12 @@ ${diagnosticRows}
   function formatBatchFailureKindLabel(kind) {
     const value = String(kind || "").trim().toLowerCase();
     if (value === "not_found") {
-      return "Thread nicht gefunden (404)";
+      return "Thread not found (404)";
     }
     if (value === "internal_iteration_error") {
-      return "Interner Batch-Fehler";
+      return "Internal batch error";
     }
-    return "Fehler";
+    return "Error";
   }
 
   function buildBatchFailureEntry({ meta, position, kind, error }) {
@@ -1680,7 +1680,7 @@ ${diagnosticRows}
       typeof error === "string"
         ? error
         : (error?.message || error || "")
-    ).trim() || "Unbekannter Fehler";
+    ).trim() || "Unknown error";
     const reasonInfo = classifyBatchFailureReason(kind, errorMessage);
 
     return {
@@ -1702,55 +1702,55 @@ ${diagnosticRows}
     if (rawKind === "not_found" || /\b404\b/.test(text) || /not\s*found|nicht gefunden/.test(text)) {
       return {
         code: "thread_not_found",
-        detail: "Konversation wurde vom Endpoint nicht gefunden (404), ID ungueltig oder im aktuellen Kontext nicht verfuegbar."
+        detail: "Conversation was not found by endpoint (404), ID invalid, or unavailable in the current context."
       };
     }
 
     if (/\b429\b/.test(text) || /rate.?limit|too many requests|drossel/.test(text)) {
       return {
         code: "rate_limited",
-        detail: "Anfragen wurden gedrosselt (Rate-Limit). Mit Backoff/Retry erneut versuchen."
+        detail: "Requests were rate-limited. Retry with backoff."
       };
     }
 
     if (/timeout|timed out|abgebrochen|abort|signal/.test(text)) {
       return {
         code: "timeout_or_abort",
-        detail: "Antwort kam nicht rechtzeitig oder die Anfrage wurde abgebrochen."
+        detail: "Response timed out or the request was aborted."
       };
     }
 
     if (/download|blob|runtime-download|speicher|quota|storage/.test(text)) {
       return {
         code: "download_or_storage_error",
-        detail: "Fehler beim Erzeugen/Speichern der Exportdatei (Download/Storage)."
+        detail: "Error while creating/saving export file (download/storage)."
       };
     }
 
     if (/keine nachrichten|keine exportierbaren nachrichten|empty|0 verwertbare nachrichten|ohne exportierbaren inhalt/.test(text)) {
       return {
         code: "empty_or_unparsed_thread",
-        detail: "Thread konnte gelesen werden, enthielt aber keine verwertbaren Nachrichten/Bodies."
+        detail: "Thread was read but contained no usable messages/bodies."
       };
     }
 
     if (/route wurde noch nicht aktiv|navigation|oeffne thread|dom-fallback/.test(text)) {
       return {
         code: "navigation_or_dom_fallback_error",
-        detail: "Navigation zum Thread oder DOM-Fallback war nicht stabil genug."
+        detail: "Navigation to thread or DOM fallback was not stable enough."
       };
     }
 
     if (rawKind === "internal_iteration_error" || /\[interner-batch-schritt\]/.test(text)) {
       return {
         code: "internal_batch_iteration_error",
-        detail: "Interner Fehler im Batch-Ablauf pro Iteration."
+        detail: "Internal error during batch iteration."
       };
     }
 
     return {
       code: "unknown_error",
-      detail: "Fehler konnte nicht eindeutig klassifiziert werden."
+      detail: "Error could not be classified clearly."
     };
   }
 
@@ -1800,7 +1800,7 @@ ${diagnosticRows}
       at: atMs,
       level: String(payload?.level || "info").trim().toLowerCase() || "info",
       code: String(payload?.code || "").trim() || "event",
-      message: String(payload?.message || "").trim() || "Ereignis",
+      message: String(payload?.message || "").trim() || "Event",
       position: Math.max(0, Number(payload?.position) || 0),
       id: String(failure?.id || meta?.id || "").trim(),
       title: sanitizeConversationTitle(failure?.title || meta?.title || ""),
@@ -1867,7 +1867,7 @@ ${diagnosticRows}
         conflictAction: "overwrite"
       });
     } catch (error) {
-      console.warn("[ChatGPT Export] Debug-Log-Checkpoint fehlgeschlagen:", error);
+      console.warn("[ChatGPT Export] Debug log checkpoint failed:", error);
     }
   }
 
@@ -1884,10 +1884,10 @@ ${diagnosticRows}
 
     const failureRows = (Array.isArray(state?.failures) ? state.failures : []).map((item, idx) => {
       const id = String(item?.id || "").trim();
-      const title = sanitizeConversationTitle(item?.title || "") || "Ohne Titel";
+      const title = sanitizeConversationTitle(item?.title || "") || "Untitled";
       const reasonCode = String(item?.reasonCode || "").trim() || "unknown_error";
       const reasonDetail = String(item?.reasonDetail || "").trim() || "";
-      const error = String(item?.error || "").trim() || "Unbekannter Fehler";
+      const error = String(item?.error || "").trim() || "Unknown error";
       const position = Math.max(0, Number(item?.position) || 0);
       return (
         "<tr>" +
@@ -1904,7 +1904,7 @@ ${diagnosticRows}
 
     const eventRows = (Array.isArray(events) ? events : []).map((item, idx) => {
       const atMs = Number(item?.at) || 0;
-      const atLabel = atMs > 0 ? formatTimestamp(new Date(atMs)) : "Zeit unbekannt";
+      const atLabel = atMs > 0 ? formatTimestamp(new Date(atMs)) : "Unknown time";
       const level = String(item?.level || "info").trim().toLowerCase() || "info";
       const code = String(item?.code || "event").trim() || "event";
       const position = Math.max(0, Number(item?.position) || 0);
@@ -1930,7 +1930,7 @@ ${diagnosticRows}
     }).join("\n");
 
     return `<!DOCTYPE html>
-<html lang="de">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1997,14 +1997,14 @@ ${diagnosticRows}
 <body>
   <main class="card">
     <section class="head">
-      <h1>Batch Debug-Log (Live-Checkpoint)</h1>
+      <h1>Batch Debug Log (Live checkpoint)</h1>
       <p><strong>Checkpoint:</strong> <time datetime="${escapeHtml(exportedIso)}">${escapeHtml(exportedLabel)}</time></p>
       <p><strong>Trigger:</strong> ${escapeHtml(trigger || "auto")}</p>
-      <p><strong>Status:</strong> ${escapeHtml(status)} | <strong>Fortschritt:</strong> ${nextIndex}/${total} | <strong>Gespeichert:</strong> ${success} | <strong>Fehler:</strong> ${failure} | <strong>Uebersprungen:</strong> ${skipped}</p>
-      <p><strong>Events (im Speicher):</strong> ${(Array.isArray(events) ? events.length : 0)} | <strong>Fehler-Eintraege:</strong> ${(Array.isArray(state?.failures) ? state.failures.length : 0)}</p>
+      <p><strong>Status:</strong> ${escapeHtml(status)} | <strong>Progress:</strong> ${nextIndex}/${total} | <strong>Saved:</strong> ${success} | <strong>Errors:</strong> ${failure} | <strong>Skipped:</strong> ${skipped}</p>
+      <p><strong>Events (in memory):</strong> ${(Array.isArray(events) ? events.length : 0)} | <strong>Error entries:</strong> ${(Array.isArray(state?.failures) ? state.failures.length : 0)}</p>
     </section>
     <section class="table-wrap">
-      <h2>Fehlerliste</h2>
+      <h2>Error list</h2>
       <table>
         <thead>
           <tr>
@@ -2012,9 +2012,9 @@ ${diagnosticRows}
             <th>Position</th>
             <th>Reason Code</th>
             <th>Reason</th>
-            <th>Thread-ID</th>
-            <th>Titel</th>
-            <th>Fehler</th>
+            <th>Conversation ID</th>
+            <th>Title</th>
+            <th>Error</th>
           </tr>
         </thead>
         <tbody>
@@ -2028,12 +2028,12 @@ ${failureRows}
         <thead>
           <tr>
             <th>#</th>
-            <th>Zeit</th>
+            <th>Time</th>
             <th>Level</th>
             <th>Code</th>
             <th>Position</th>
-            <th>Thread-ID</th>
-            <th>Titel</th>
+            <th>Conversation ID</th>
+            <th>Title</th>
             <th>Message</th>
             <th>Reason Code</th>
             <th>Error</th>
@@ -2090,7 +2090,7 @@ ${eventRows}
           ? ("Batch " + pos + "/" + total + " | ")
           : "";
         setStatus(
-          prefix + "Bilder einbetten " + (index + 1) + "/" + targetImageSources.length + "...",
+          prefix + "Embedding images " + (index + 1) + "/" + targetImageSources.length + "...",
           "busy"
         );
       }
@@ -2122,7 +2122,7 @@ ${eventRows}
     }
 
     if (failedCount > 0 || skippedBySize > 0 || skippedByBudget > 0 || skippedByCount > 0) {
-      console.warn("[ChatGPT Export] Einige Bilder konnten nicht eingebettet werden.", {
+      console.warn("[ChatGPT Export] Some images could not be embedded.", {
         totalFound: uniqueImageSources.length,
         embedded: imageMap.size,
         failed: failedCount,
@@ -2303,7 +2303,7 @@ ${eventRows}
     const raw = await new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(String(reader.result || ""));
-      reader.onerror = () => reject(reader.error || new Error("Blob konnte nicht gelesen werden."));
+      reader.onerror = () => reject(reader.error || new Error("Blob could not be read."));
       reader.readAsDataURL(blob);
     });
 
@@ -2364,7 +2364,7 @@ ${eventRows}
       if (batchRunContext && batchRunContext.running) {
         batchRunContext.cancelRequested = true;
       }
-      setStatus("Stopp angefordert. Aktueller Schritt wird beendet...", "busy", 9000);
+      setStatus("Stop requested. Current step will finish...", "busy", 9000);
       return true;
     }
 
@@ -2373,7 +2373,7 @@ ${eventRows}
       savedState.status = "paused";
       savedState.updatedAt = Date.now();
       saveBatchState(savedState);
-      setStatus("Batch pausiert.", "success", 5000);
+      setStatus("Batch paused.", "success", 5000);
       return true;
     }
 
@@ -2381,7 +2381,7 @@ ${eventRows}
   }
 
   function createExportCancelledError() {
-    const error = new Error("Export wurde vom Nutzer gestoppt.");
+    const error = new Error("Export was stopped by user.");
     error.code = "export_cancelled";
     return error;
   }
@@ -2408,7 +2408,7 @@ ${eventRows}
     const conversationId = getConversationIdFromPath() || "";
     await waitForCapturedConversationData(conversationId, 1400);
 
-    progressCallback("Sammle Nachrichten aus DOM...", "busy");
+    progressCallback("Collecting messages from DOM...", "busy");
     const domMessages = await collectMessagesFromDom(progressCallback, {
       allowExtendedWait: options?.allowExtendedWait !== false,
       isCancelled: typeof options?.isCancelled === "function" ? options.isCancelled : null
@@ -2786,10 +2786,10 @@ ${eventRows}
     const label = Number.isFinite(totalKnown)
       ? (totalLikelyReliable
         ? String(totalKnown)
-        : (String(totalKnown) + " (aktuell geladen, es koennen mehr sein)"))
+        : (String(totalKnown) + " (currently loaded, there may be more)"))
       : "unbekannt";
     const input = window.prompt(
-      "Batch-Export gestartet.\nGesamtzahl Threads: " + label + ".\nWieviele exportieren?\nLeer = alle.",
+      "Batch export started.\nTotal threads: " + label + ".\nHow many should be exported?\nLeave empty = all.",
       ""
     );
 
@@ -2804,7 +2804,7 @@ ${eventRows}
 
     const parsed = Number(trimmed);
     if (!Number.isFinite(parsed) || parsed <= 0) {
-      throw new Error("Bitte eine positive Zahl fuer den Batch-Export eingeben.");
+      throw new Error("Please enter a positive number for batch export.");
     }
 
     return Math.floor(parsed);
@@ -2858,7 +2858,7 @@ ${eventRows}
     while (hasMore && collected.length < targetCount && pageNumber < BATCH_MAX_PAGES) {
       pageNumber += 1;
       progressCallback(
-        "Batch: Lade Thread-Liste (" + collected.length + " gesammelt, Seite " + pageNumber + ")...",
+        "Batch: Loading thread list (" + collected.length + " collected, page " + pageNumber + ")...",
         "busy"
       );
 
@@ -2890,7 +2890,7 @@ ${eventRows}
     }
 
     if (collected.length < targetCount) {
-      progressCallback("Batch: Sidebar wird gescannt, um weitere Threads nachzuladen...", "busy");
+      progressCallback("Batch: Scanning sidebar to load more threads...", "busy");
       const sidebarItems = await collectConversationMetasFromSidebarSweep({
         knownIds: seen,
         targetCount,
@@ -2926,7 +2926,7 @@ ${eventRows}
 
     for (let attempt = 1; attempt <= BATCH_LIST_MAX_RETRIES; attempt += 1) {
       if (progressCallback && attempt > 1) {
-        progressCallback("Batch: Liste Retry " + attempt + "/" + BATCH_LIST_MAX_RETRIES + "...", "busy");
+        progressCallback("Batch: List retry " + attempt + "/" + BATCH_LIST_MAX_RETRIES + "...", "busy");
       }
 
       for (let endpointIndex = 0; endpointIndex < endpointCandidates.length; endpointIndex += 1) {
@@ -2941,7 +2941,7 @@ ${eventRows}
           }, BATCH_LIST_TIMEOUT_MS);
 
           if (!response.ok) {
-            lastError = new Error("HTTP " + response.status + " beim Laden der Thread-Liste");
+            lastError = new Error("HTTP " + response.status + " while loading thread list");
             continue;
           }
 
@@ -2971,7 +2971,7 @@ ${eventRows}
       return lastSuccessfulBody;
     }
 
-    throw lastError || new Error("Thread-Liste konnte nicht geladen werden.");
+    throw lastError || new Error("Thread list could not be loaded.");
   }
 
   function buildConversationListEndpointCandidates(offset, limit) {
@@ -3285,7 +3285,7 @@ ${eventRows}
 
       if (pass % 10 === 0) {
         progressCallback(
-          "Batch: Sidebar-Scan Pass " + pass + " (" + collected.length + " zusaetzliche Threads gefunden)...",
+          "Batch: Sidebar scan pass " + pass + " (" + collected.length + " additional threads found)...",
           "busy"
         );
       }
@@ -3344,7 +3344,7 @@ ${eventRows}
     let lastPulseAt = 0;
 
     while ((Date.now() - startedAt) < SIDEBAR_SWEEP_WAIT_MS) {
-      const visibleReady = await waitForSidebarSweepVisibility(progressCallback, "Sidebar-Nachladen");
+      const visibleReady = await waitForSidebarSweepVisibility(progressCallback, "Sidebar reload");
       if (!visibleReady) {
         throw createSidebarSweepHiddenTimeoutError();
       }
@@ -3362,7 +3362,7 @@ ${eventRows}
 
       const now = Date.now();
       if ((now - lastPulseAt) >= 2400) {
-        progressCallback("Batch: warte auf nachladende Sidebar-Threads...", "busy");
+        progressCallback("Batch: waiting for sidebar threads to load...", "busy");
         lastPulseAt = now;
       }
     }
@@ -3394,7 +3394,7 @@ ${eventRows}
 
       if (typeof progressCallback === "function") {
         progressCallback(
-          "Batch: pruefe Sidebar-Ende (" + round + "/" + SIDEBAR_SWEEP_END_VERIFY_ROUNDS + ")...",
+          "Batch: checking sidebar end (" + round + "/" + SIDEBAR_SWEEP_END_VERIFY_ROUNDS + ")...",
           "busy"
         );
       }
@@ -3431,7 +3431,7 @@ ${eventRows}
 
   function createSidebarSweepHiddenTimeoutError() {
     const error = new Error(
-      "Sidebar-Scan pausiert: ChatGPT-Tab war zu lange im Hintergrund. Bitte Tab in den Vordergrund und Batch erneut starten."
+      "Sidebar scan paused: ChatGPT tab stayed in the background too long. Bring the tab to foreground and start batch again."
     );
     error.code = "sidebar_hidden_timeout";
     return error;
@@ -3455,7 +3455,7 @@ ${eventRows}
       if ((now - lastNoticeAt) >= SIDEBAR_SWEEP_HIDDEN_NOTICE_MS) {
         if (typeof progressCallback === "function") {
           progressCallback(
-            "Batch: " + label + " wartet, ChatGPT-Tab im Vordergrund lassen...",
+            "Batch: " + label + " waiting, keep the ChatGPT tab in foreground...",
             "busy"
           );
         }
@@ -3616,14 +3616,14 @@ ${eventRows}
             attemptHitRateLimit = true;
             attemptSawNon404 = true;
             sawOnlyNotFound = false;
-            lastError = new Error("HTTP 429 (Rate-Limit) beim Laden der Konversation");
+            lastError = new Error("HTTP 429 (rate limit) while loading conversation");
             break;
           }
 
           if (response.status !== 404) {
             attemptSawNon404 = true;
             sawOnlyNotFound = false;
-            lastError = new Error("HTTP " + response.status + " beim Laden der Konversation");
+            lastError = new Error("HTTP " + response.status + " while loading conversation");
             break;
           }
         }
@@ -3651,7 +3651,7 @@ ${eventRows}
       const waitMs = baseDelayMs + jitterMs;
       if (typeof progressCallback === "function") {
         progressCallback(
-          contextLabel + " fehlgeschlagen, neuer Versuch in " + Math.round(waitMs / 1000) + "s...",
+          contextLabel + " failed, retrying in " + Math.round(waitMs / 1000) + "s...",
           "busy"
         );
       }
@@ -3660,17 +3660,17 @@ ${eventRows}
 
     if (sawOnlyNotFound) {
       if (attempted.length > 0) {
-        console.warn("[ChatGPT Export] Konversations-API nur 404.", {
+        console.warn("[ChatGPT Export] Conversation API returned only 404.", {
           conversationId: String(conversationId || ""),
           attempted
         });
       }
-      const notFoundError = new Error("HTTP 404 beim Laden der Konversation");
+      const notFoundError = new Error("HTTP 404 while loading conversation");
       notFoundError.code = "conversation_not_found";
       throw notFoundError;
     }
 
-    throw lastError || new Error("Konversations-API nicht erreichbar");
+    throw lastError || new Error("Conversation API unreachable");
   }
 
   function isConversationNotFoundError(error) {
@@ -3946,7 +3946,7 @@ ${eventRows}
         }, 0);
       };
       script.onerror = () => {
-        reject(new Error("Page-Bridge Script konnte nicht geladen werden."));
+        reject(new Error("Page-bridge script could not be loaded."));
         script.remove();
       };
 
@@ -4117,7 +4117,7 @@ ${eventRows}
       }
 
       if (current) {
-        current.textContent = "Zeit: " + timestampInfo.display;
+        current.textContent = "Time: " + timestampInfo.display;
         if (timestampInfo.iso) {
           current.setAttribute("data-iso", timestampInfo.iso);
         }
@@ -4130,7 +4130,7 @@ ${eventRows}
       if (timestampInfo.iso) {
         badge.setAttribute("data-iso", timestampInfo.iso);
       }
-      badge.textContent = "Zeit: " + timestampInfo.display;
+      badge.textContent = "Time: " + timestampInfo.display;
       messageNode.insertBefore(badge, messageNode.firstChild);
     });
   }
@@ -4337,7 +4337,7 @@ ${eventRows}
 
     const imageHtml = urls.map((url, index) => {
       const src = escapeHtml(url);
-      const alt = escapeHtml("Bild " + (index + 1));
+      const alt = escapeHtml("Image " + (index + 1));
       return (
         '<figure class="export-image-figure">' +
         '<img src="' + src + '" alt="' + alt + '" loading="lazy" decoding="async" data-lightbox="1">' +
@@ -4407,7 +4407,7 @@ ${eventRows}
               text: nextText,
               bodyHtml: nextBodyHtml,
               timestampIso: hasExistingTimestamp ? existing.timestampIso : (timestampInfo?.iso || ""),
-              timestampDisplay: hasExistingTimestamp ? existing.timestampDisplay : (timestampInfo?.display || "Zeit unbekannt")
+              timestampDisplay: hasExistingTimestamp ? existing.timestampDisplay : (timestampInfo?.display || "Unknown time")
             });
             turnMessageIds.push(messageId);
             return;
@@ -4420,7 +4420,7 @@ ${eventRows}
             text: text || "",
             bodyHtml,
             timestampIso: timestampInfo?.iso || "",
-            timestampDisplay: timestampInfo?.display || "Zeit unbekannt",
+            timestampDisplay: timestampInfo?.display || "Unknown time",
             order: orderCounter++
           });
           turnMessageIds.push(messageId);
@@ -4456,10 +4456,10 @@ ${eventRows}
           id: syntheticId,
           role,
           label: roleLabel(role),
-          text: "[Bild]",
+          text: "[Image]",
           bodyHtml: turnImageHtml,
           timestampIso: timestamp ? timestamp.toISOString() : "",
-          timestampDisplay: timestamp ? formatTimestamp(timestamp) : "Zeit unbekannt",
+          timestampDisplay: timestamp ? formatTimestamp(timestamp) : "Unknown time",
           order: orderCounter++
         });
       });
@@ -4498,7 +4498,7 @@ ${eventRows}
         collectNow();
 
         if (pass % 10 === 0) {
-          progressCallback("DOM-Fallback: lade lange Historie (Pass " + pass + ")...", "busy");
+          progressCallback("DOM fallback: loading long history (pass " + pass + ")...", "busy");
         }
 
         const currentTop = getScrollerTop(scroller);
@@ -4641,7 +4641,7 @@ ${eventRows}
           collected: null,
           progressCallback,
           isCancelled,
-          stageLabel: "Thread-Ende",
+          stageLabel: "Conversation end",
           passLabel: longWaitAttempts + "/" + DOM_LONG_WAIT_RESCAN_LIMIT
         });
         if (sawGrowth) {
@@ -4656,7 +4656,7 @@ ${eventRows}
       }
 
       if (pass % 12 === 0) {
-        progressCallback("DOM-Fallback: synchronisiere Thread-Ende...", "busy");
+        progressCallback("DOM fallback: synchronizing conversation end...", "busy");
       }
 
       previousTop = currentTop;
@@ -4703,7 +4703,7 @@ ${eventRows}
 
       if (!loadingActive && (now - lastLoadingSignalAt) >= DOM_LONG_WAIT_NO_ACTIVITY_EXIT_MS) {
         progressCallback(
-          "DOM-Fallback: kein weiteres Nachladen erkannt (" + stageLabel + "), gehe weiter...",
+          "DOM fallback: no further loading detected (" + stageLabel + "), continuing...",
           "busy"
         );
         return false;
@@ -4711,7 +4711,7 @@ ${eventRows}
 
       if ((now - lastPulseAt) >= 6000) {
         progressCallback(
-          "DOM-Fallback: warte auf sehr langsames Nachladen (" + stageLabel + ", " + passLabel + ")...",
+          "DOM fallback: waiting for very slow loading (" + stageLabel + ", " + passLabel + ")...",
           "busy"
         );
         lastPulseAt = now;
@@ -4719,7 +4719,7 @@ ${eventRows}
 
       if ((now - lastNoGrowthNoticeAt) >= DOM_LONG_WAIT_IDLE_MS) {
         progressCallback(
-          "DOM-Fallback: weiterhin keine neuen Elemente (" + stageLabel + "), warte weiter...",
+          "DOM fallback: still no new elements (" + stageLabel + "), waiting...",
           "busy"
         );
         lastNoGrowthNoticeAt = now;
@@ -4838,7 +4838,7 @@ ${eventRows}
       return "ChatGPT";
     }
     if (role === "user") {
-      return "Du";
+      return "You";
     }
     if (role === "system") {
       return "System";
@@ -4846,7 +4846,7 @@ ${eventRows}
     if (role === "tool") {
       return "Tool";
     }
-    return "Unbekannt";
+    return "Unknown";
   }
 
   function normalizeTimestamp(value) {
@@ -4930,11 +4930,11 @@ ${eventRows}
 
   function formatTimestamp(date) {
     if (!date) {
-      return "Zeit unbekannt";
+      return "Unknown time";
     }
 
     try {
-      return new Intl.DateTimeFormat("de-DE", {
+      return new Intl.DateTimeFormat("en-US", {
         dateStyle: "medium",
         timeStyle: "medium"
       }).format(date);
@@ -5023,13 +5023,13 @@ ${eventRows}
   function assertExportableConversationMessages(messages) {
     const list = Array.isArray(messages) ? messages : [];
     if (list.length === 0) {
-      throw new Error("Keine Nachrichten im Thread.");
+      throw new Error("No messages in thread.");
     }
     const meaningfulCount = list.reduce((acc, message) => (
       acc + (hasMeaningfulExportMessage(message) ? 1 : 0)
     ), 0);
     if (meaningfulCount <= 0) {
-      throw new Error("Thread ohne exportierbaren Inhalt (0 verwertbare Nachrichten).");
+      throw new Error("Conversation without exportable content (0 usable messages).");
     }
   }
 
@@ -5087,7 +5087,7 @@ ${eventRows}
       seenSources.add(src);
 
       const altRaw = String(img.getAttribute("alt") || "").trim();
-      const alt = escapeHtml(altRaw || ("Bild " + (figures.length + 1)));
+      const alt = escapeHtml(altRaw || ("Image " + (figures.length + 1)));
       figures.push(
         '<figure class="export-image-figure">' +
         '<img src="' + escapeHtml(src) + '" alt="' + alt + '" loading="lazy" decoding="async" data-lightbox="1">' +
@@ -5714,13 +5714,13 @@ ${eventRows}
         const calloutType = String(calloutMatch[1] || "note").toLowerCase();
         const calloutText = String(calloutMatch[2] || "").trim();
         const labelMap = {
-          note: "Hinweis",
-          tip: "Tipp",
-          important: "Wichtig",
-          warning: "Warnung",
-          caution: "Achtung"
+          note: "Note",
+          tip: "Tip",
+          important: "Important",
+          warning: "Warning",
+          caution: "Caution"
         };
-        const calloutLabel = labelMap[calloutType] || "Hinweis";
+        const calloutLabel = labelMap[calloutType] || "Note";
         const body = calloutText ? "<p>" + renderInlineMarkdown(calloutText) + "</p>" : "";
         out.push(
           '<aside class="callout callout-' + escapeHtml(calloutType) + '">' +
@@ -5930,13 +5930,13 @@ ${eventRows}
       ? threadStartedAt
       : null;
     const startedIso = startedAt ? startedAt.toISOString() : "";
-    const startedLabel = startedAt ? formatTimestamp(startedAt) : "Zeit unbekannt";
+    const startedLabel = startedAt ? formatTimestamp(startedAt) : "Unknown time";
 
     const items = messages
       .map((message, index) => {
         const roleClass = "role-" + escapeHtml(message.role || "unknown");
-        const label = escapeHtml(message.label || "Unbekannt");
-        const timestampDisplay = escapeHtml(message.timestampDisplay || "Zeit unbekannt");
+        const label = escapeHtml(message.label || "Unknown");
+        const timestampDisplay = escapeHtml(message.timestampDisplay || "Unknown time");
         const timestampIso = escapeHtml(message.timestampIso || "");
         const bodyHtml = resolveMessageBodyHtml(message);
         const count = index + 1;
@@ -5958,7 +5958,7 @@ ${eventRows}
       .join("\n");
 
     return `<!DOCTYPE html>
-<html lang="de">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -6973,22 +6973,22 @@ ${eventRows}
   <main class="page" id="top">
     <section class="header">
       <h1>${safeTitle}</h1>
-      <p><strong>Exportiert:</strong> <time datetime="${escapeHtml(exportIso)}">${escapeHtml(exportedLabel)}</time></p>
-      <p><strong>Thread-Beginn:</strong> ${startedAt ? ('<time datetime="' + escapeHtml(startedIso) + '">' + escapeHtml(startedLabel) + "</time>") : escapeHtml(startedLabel)}</p>
-      <p><strong>Quelle:</strong> ${escapeHtml(source)}</p>
-      <p><strong>Nachrichten:</strong> ${messages.length}</p>
+      <p><strong>Exported:</strong> <time datetime="${escapeHtml(exportIso)}">${escapeHtml(exportedLabel)}</time></p>
+      <p><strong>Thread start:</strong> ${startedAt ? ('<time datetime="' + escapeHtml(startedIso) + '">' + escapeHtml(startedLabel) + "</time>") : escapeHtml(startedLabel)}</p>
+      <p><strong>Source:</strong> ${escapeHtml(source)}</p>
+      <p><strong>Messages:</strong> ${messages.length}</p>
       <p><strong>URL:</strong> ${safeUrl ? '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' + safeUrl + '</a>' : '-'}</p>
     </section>
     <section class="thread">
 ${items}
     </section>
     <footer class="footer">
-      <a href="#top">Nach oben</a>
-      <span>${messages.length} Nachrichten &middot; Exportiert ${escapeHtml(exportedLabel)}</span>
+      <a href="#top">Back to top</a>
+      <span>${messages.length} Messages &middot; Exported ${escapeHtml(exportedLabel)}</span>
     </footer>
   </main>
   <div class="image-lightbox" id="image-lightbox" aria-hidden="true">
-    <button type="button" class="lightbox-close" id="image-lightbox-close" aria-label="Bild schliessen">&times;</button>
+    <button type="button" class="lightbox-close" id="image-lightbox-close" aria-label="Close image">&times;</button>
     <img id="image-lightbox-img" alt="">
     <div class="lightbox-caption" id="image-lightbox-caption"></div>
   </div>
@@ -7024,7 +7024,7 @@ ${items}
         var alt = String(img.getAttribute("alt") || "").trim();
         var original = String(img.getAttribute("data-export-original-src") || "").trim();
         lightboxImg.setAttribute("src", src);
-        lightboxImg.setAttribute("alt", alt || "Bild");
+        lightboxImg.setAttribute("alt", alt || "Image");
         lightboxCaption.textContent = original || alt || "";
         lightbox.classList.add("open");
         lightbox.setAttribute("aria-hidden", "false");
@@ -7099,11 +7099,11 @@ ${items}
             (downloadId) => {
               const runtimeError = chrome.runtime?.lastError;
               if (runtimeError) {
-                reject(new Error(runtimeError.message || "Download fehlgeschlagen"));
+                reject(new Error(runtimeError.message || "Download failed"));
                 return;
               }
               if (typeof downloadId !== "number") {
-                reject(new Error("Download konnte nicht gestartet werden"));
+                reject(new Error("Download could not be started"));
                 return;
               }
               resolve(downloadId);
@@ -7138,7 +7138,7 @@ ${items}
 
   async function triggerDownloadViaRuntime(html, filename, conflictAction) {
     if (!chrome?.runtime?.sendMessage) {
-      throw new Error("runtime messaging nicht verfuegbar");
+      throw new Error("runtime messaging not available");
     }
 
     const payload = {
@@ -7152,11 +7152,11 @@ ${items}
       chrome.runtime.sendMessage(payload, (response) => {
         const runtimeError = chrome.runtime?.lastError;
         if (runtimeError) {
-          reject(new Error(runtimeError.message || "Runtime-Download Kommunikation fehlgeschlagen"));
+          reject(new Error(runtimeError.message || "Runtime download communication failed"));
           return;
         }
         if (!response?.ok) {
-          reject(new Error(response?.error || "Runtime-Download fehlgeschlagen"));
+          reject(new Error(response?.error || "Runtime-Download failed"));
           return;
         }
         resolve(response);
@@ -7330,6 +7330,7 @@ ${items}
       "[aria-label*='Profile menu'][data-testid*='profile']",
       "[aria-label*='Account menu'][data-testid*='profile']",
       "[aria-label*='Profil-Menü öffnen']",
+      "[aria-label*='Profil menu'][data-testid*='profile']",
       "[aria-label*='Open profile menu']",
       "[aria-label*='Open account menu']"
     ];
@@ -7628,10 +7629,10 @@ ${items}
       if ((now - lastNoticeAt) >= BATCH_HIDDEN_NOTICE_MS) {
         const doneText = String(completedLabel || "").trim();
         const batchPart = indexLabel ? ("Batch " + indexLabel + " | ") : "Batch | ";
-        const donePart = doneText ? (doneText + " abgeschlossen: ") : "";
+        const donePart = doneText ? (doneText + " completed: ") : "";
         if (typeof progressCallback === "function") {
           progressCallback(
-            batchPart + donePart + "warte: Bitte ChatGPT-Tab im Vordergrund lassen...",
+            batchPart + donePart + "waiting: Keep the ChatGPT tab in the foreground...",
             "busy"
           );
         }
@@ -7648,4 +7649,5 @@ ${items}
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 })();
+
 

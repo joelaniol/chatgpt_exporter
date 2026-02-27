@@ -4,7 +4,7 @@ Chrome Extension (Manifest V3) that exports ChatGPT conversations to standalone 
 
 ## Maintainer
 - Author: Joel Aniol
-- Contact: joel@gnetwork.eu
+- Contact: https://www.linkedin.com/in/joelaniol/
 
 Note:
 - Chrome MV3 does not use an `author` key in `manifest.json`, so maintainer metadata is documented here.

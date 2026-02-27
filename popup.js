@@ -18,7 +18,7 @@ let pollTimer = null;
 let refreshInFlight = false;
 
 init().catch((error) => {
-  setHint("Fehler beim Laden: " + (error?.message || String(error)), "error");
+  setHint("Error while loading: " + (error?.message || String(error)), "error");
   setControlsEnabled({
     canExport: false,
     canBatch: false,
@@ -30,7 +30,7 @@ init().catch((error) => {
 });
 
 exportBtn.addEventListener("click", async () => {
-  await startAction("chatgpt-export-trigger", "Export gestartet. Fortschritt im Tab sichtbar.");
+  await startAction("chatgpt-export-trigger", "Export started. Progress is visible in the tab.");
 });
 
 batchBtn.addEventListener("click", async () => {
@@ -59,7 +59,7 @@ resumeBatchBtn.addEventListener("click", async () => {
 });
 
 cancelBatchBtn.addEventListener("click", async () => {
-  await startAction("chatgpt-export-cancel-trigger", "Stopp angefordert.");
+  await startAction("chatgpt-export-cancel-trigger", "Stop requested.");
 });
 
 yearFolderToggle.addEventListener("change", async () => {
@@ -75,12 +75,12 @@ yearFolderToggle.addEventListener("change", async () => {
       yearOnly
     });
     if (!response?.ok) {
-      throw new Error(response?.error || "Ordner-Modus konnte nicht gespeichert werden.");
+      throw new Error(response?.error || "Folder mode could not be saved.");
     }
-    setHint(yearOnly ? "Batch-Ordner: nur Jahr." : "Batch-Ordner: Jahr und Monat.", "success");
+    setHint(yearOnly ? "Batch folders: year only." : "Batch folders: year and month.", "success");
   } catch (error) {
     yearFolderToggle.checked = !yearOnly;
-    setHint("Ordner-Modus fehlgeschlagen: " + (error?.message || String(error)), "error");
+    setHint("Folder mode failed: " + (error?.message || String(error)), "error");
   }
 });
 
@@ -97,12 +97,12 @@ debugLogToggle.addEventListener("change", async () => {
       enabled
     });
     if (!response?.ok) {
-      throw new Error(response?.error || "Debug-Log-Modus konnte nicht gespeichert werden.");
+      throw new Error(response?.error || "Debug log mode could not be saved.");
     }
-    setHint(enabled ? "Batch-Debug-Log aktiv." : "Batch-Debug-Log deaktiviert.", "success");
+    setHint(enabled ? "Batch debug log enabled." : "Batch debug log disabled.", "success");
   } catch (error) {
     debugLogToggle.checked = !enabled;
-    setHint("Debug-Log-Modus fehlgeschlagen: " + (error?.message || String(error)), "error");
+    setHint("Debug log mode failed: " + (error?.message || String(error)), "error");
   }
 });
 
@@ -125,13 +125,13 @@ async function init() {
 
   const tab = await getActiveTab();
   if (!tab || typeof tab.id !== "number") {
-    setHint("Kein aktiver Tab gefunden.", "error");
+    setHint("No active tab found.", "error");
     return;
   }
 
   activeTabId = tab.id;
   if (!isChatgptUrl(tab.url)) {
-    setHint("Bitte einen Tab auf chatgpt.com oeffnen.", "error");
+    setHint("Please open a tab on chatgpt.com.", "error");
     return;
   }
 
@@ -151,7 +151,7 @@ function startStatePolling() {
 
 async function startAction(type, successText, extraPayload = null) {
   if (!stateReady || activeTabId == null) {
-    setHint("Tab ist nicht bereit.", "error");
+    setHint("Tab is not ready.", "error");
     return;
   }
 
@@ -163,7 +163,7 @@ async function startAction(type, successText, extraPayload = null) {
     canYearToggle: false,
     canDebugToggle: false
   });
-  setHint("Starte...", "");
+  setHint("Starting...", "");
 
   try {
     const message = { type };
@@ -173,12 +173,12 @@ async function startAction(type, successText, extraPayload = null) {
 
     const response = await sendToActiveTabWithTimeout(message, TAB_MESSAGE_TIMEOUT_MS + 800);
     if (!response?.ok) {
-      throw new Error(response?.error || "Aktion konnte nicht gestartet werden.");
+      throw new Error(response?.error || "Action could not be started.");
     }
 
     setHint(successText, "success");
   } catch (error) {
-    setHint("Fehler: " + (error?.message || String(error)), "error");
+    setHint("Error: " + (error?.message || String(error)), "error");
   } finally {
     await refreshState();
   }
@@ -293,7 +293,7 @@ function applyUiFromState(state, options = {}) {
       canDebugToggle: false
     });
     if (!options.fromPoll) {
-      setHint("Status konnte nicht gelesen werden.", "error");
+      setHint("Could not read status.", "error");
     }
     return;
   }
@@ -326,29 +326,29 @@ function applyUiFromState(state, options = {}) {
 
   if (!state.isConversationPage) {
     if (state.source === "storage") {
-      setHint("Tab reagiert langsam. Letzter Lauf ist nicht mehr aktiv.", "error");
+      setHint("Tab is responding slowly. Last run is no longer active.", "error");
       return;
     }
-    setHint("Batch verfuegbar. Einzel-Export nur in /c/...", "success");
+    setHint("Batch is available. Single export works only on /c/... pages.", "success");
     return;
   }
 
-  setHint("Bereit.", "success");
+  setHint("Ready.", "success");
 }
 
 function buildBusyHint(state) {
   const rawMessage = String(state.runtimeStatusMessage || "").trim();
   const started = Number(state.runtimeStartedAt) || 0;
-  const since = started > 0 ? " (seit " + formatDuration(Date.now() - started) + ")" : "";
+  const since = started > 0 ? " (since " + formatDuration(Date.now() - started) + ")" : "";
   const mode = state.runtimeOperation === "batch" ? "Batch" : "Export";
   const progressText = buildBatchProgressText(state);
-  const detailText = rawMessage || (mode + " laeuft...");
+  const detailText = rawMessage || (mode + " is running...");
   const text = progressText ? (progressText + " | " + detailText) : detailText;
 
   if (state.source === "storage") {
-    return mode + " laeuft, Tab antwortet langsam: " + text + since;
+    return mode + " is running, tab responds slowly: " + text + since;
   }
-  return mode + " laeuft: " + text + since;
+  return mode + " is running: " + text + since;
 }
 
 function buildBatchProgressText(state) {
@@ -365,15 +365,15 @@ function buildBatchProgressText(state) {
   const success = Math.min(total, Math.max(0, Number(state.batchSuccessCount) || 0));
   const failure = Math.min(total, Math.max(0, Number(state.batchFailureCount) || 0));
   const skipped = Math.min(total, Math.max(0, Number(state.batchSkippedCount) || 0));
-  const current = done < total ? ", aktuell " + (done + 1) + "/" + total : "";
+  const current = done < total ? ", current " + (done + 1) + "/" + total : "";
 
   return (
     done +
     "/" + total +
-    " abgeschlossen (" +
-    success + " gespeichert, " +
-    failure + " Fehler, " +
-    skipped + " uebersprungen" +
+    " completed (" +
+    success + " saved, " +
+    failure + " errors, " +
+    skipped + " skipped" +
     current +
     ")"
   );
@@ -450,7 +450,7 @@ async function sendToActiveTabWithTimeout(message, timeoutMs = TAB_MESSAGE_TIMEO
     sendToActiveTab(message),
     new Promise((_, reject) => {
       setTimeout(() => {
-        reject(new Error("Zeitueberschreitung bei Tab-Kommunikation."));
+        reject(new Error("Timed out while communicating with tab."));
       }, timeoutMs);
     })
   ]);
@@ -458,14 +458,14 @@ async function sendToActiveTabWithTimeout(message, timeoutMs = TAB_MESSAGE_TIMEO
 
 function sendToActiveTab(message) {
   if (activeTabId == null) {
-    return Promise.reject(new Error("Kein aktiver Tab."));
+    return Promise.reject(new Error("No active tab."));
   }
 
   return new Promise((resolve, reject) => {
     chrome.tabs.sendMessage(activeTabId, message, (response) => {
       const runtimeError = chrome.runtime?.lastError;
       if (runtimeError) {
-        reject(new Error(runtimeError.message || "Kommunikation fehlgeschlagen."));
+        reject(new Error(runtimeError.message || "Communication failed."));
         return;
       }
       resolve(response);
