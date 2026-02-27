@@ -15,6 +15,13 @@ Chrome extension (Manifest V3) to export ChatGPT conversations as standalone HTM
 - Full-size image embedding for backup-grade exports.
 - Click-to-open lightbox for images in exported HTML.
 
+## Screenshots
+![Export Dialog](media/screenshot-chatgpt-export-dialog.png)
+![Store Screenshot](media/screenshot-store-1280x800.png)
+
+## Promo Image
+![ChatGPT Thread Exporter Promo](media/linkedin-chatgpt-exporter-v1.4.0.png)
+
 ## Install (Chrome)
 1. Download the project ZIP from GitHub.
 2. Extract it to a local folder.
