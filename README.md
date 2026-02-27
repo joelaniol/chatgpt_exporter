@@ -96,11 +96,6 @@ Batch export can run for a long time, especially with large histories.
 - Do not use suffixes in `version` (`-beta`, `+build`, `rc1`, etc.).
 - Optional: use `version_name` for human-readable labels.
 
-## Recommended Release Strategy
-- Patch (`x.y.Z`): bug fixes only.
-- Minor (`x.Y.0`): backward-compatible features.
-- Major (`X.0.0`): breaking changes.
-
 ## Release Checklist
 1. Bump `version` in `manifest.json` (and `version_name` if used).
 2. Update README/changelog.
