@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChatGPT Export</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="popup">
+    <h1>ChatGPT Export</h1>
+    <p id="hint" class="hint">Pruefe aktiven Tab...</p>
+
+    <label class="toggle top">
+      <input id="yearFolderToggle" type="checkbox">
+      <span>Batch: nur Jahresordner</span>
+    </label>
+    <label class="toggle top">
+      <input id="debugLogToggle" type="checkbox">
+      <span>Batch: Debug-Log live (Datei)</span>
+    </label>
+
+    <div class="actions">
+      <button id="exportBtn" type="button">Speichern</button>
+      <button id="batchBtn" type="button" class="secondary">Batch speichern</button>
+      <button id="resumeBatchBtn" type="button" class="secondary">Batch fortsetzen</button>
+      <button id="cancelBatchBtn" type="button" class="danger">Export stoppen</button>
+    </div>
+
+    <p class="meta">Batch saves to: Chat GPT/Account/Year/Month (optional year-only). Hold this tab in foreground and do nothing while batch export is running; it can take a long, long time.</p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>
