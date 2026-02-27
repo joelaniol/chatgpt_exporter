@@ -33,6 +33,7 @@ Chrome extension (Manifest V3) to export ChatGPT conversations as standalone HTM
 
 ## Important Batch Rule
 Keep the ChatGPT tab in the foreground while batch export is running.
+- Do not use ChatGPT in a second tab or window during export.
 - Do not switch tabs/windows.
 - Do not scroll or click manually during the run.
 - Large histories can take a long time due to lazy loading.
