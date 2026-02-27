@@ -58,5 +58,10 @@ Keep the ChatGPT tab in the foreground while batch export is running.
 - One conversation works manually but fails in batch:
   - Check the failure report (and debug checkpoint, if enabled) for reason codes.
 
+## Platform Change Notice
+- ChatGPT is a live platform and OpenAI can change UI structure, DOM, routes, or APIs at any time.
+- If that happens, parts of this extension can break until updated.
+- If you hit a new breakage, please send me a short LinkedIn message with what failed and (if possible) a screenshot.
+
 ## Contact
 - Joel Aniol: https://www.linkedin.com/in/joelaniol/
