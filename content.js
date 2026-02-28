@@ -87,6 +87,8 @@
   let inlineRefreshShowStatus = false;
   let capturedTimestampMapsByConversation = new Map();
   let capturedTitlesByConversation = new Map();
+  let baselineMessageIdsByConversation = new Map();
+  let observedTimestampFallbacksByConversation = new Map();
   let pagePayloadListenerInstalled = false;
   let pageBridgeReadyPromise = null;
   let batchRunContext = null;
@@ -111,9 +113,32 @@
     void ensurePageBridge().catch((error) => {
       console.warn("[ChatGPT Export] Page bridge init failed:", error);
     });
+    scheduleInitialConversationBaselineCapture();
     removeInlineTimestampBadges();
     scheduleBatchAutoResume();
     persistRuntimeState(true);
+  }
+
+  function scheduleInitialConversationBaselineCapture() {
+    const capture = () => {
+      const conversationId = getConversationIdFromPath() || "";
+      if (!conversationId) {
+        return;
+      }
+      if (baselineMessageIdsByConversation.has(conversationId)) {
+        return;
+      }
+      const baseline = collectCurrentConversationMessageIdsFromDom();
+      if (baseline.size <= 0) {
+        return;
+      }
+      baselineMessageIdsByConversation.set(conversationId, baseline);
+      trimCapturedConversationCache();
+    };
+
+    setTimeout(capture, 80);
+    setTimeout(capture, 900);
+    setTimeout(capture, 2400);
   }
 
   function installRouteObserver() {
@@ -280,6 +305,8 @@
       const oldestConversationId = capturedTimestampMapsByConversation.keys().next().value;
       capturedTimestampMapsByConversation.delete(oldestConversationId);
       capturedTitlesByConversation.delete(oldestConversationId);
+      baselineMessageIdsByConversation.delete(oldestConversationId);
+      observedTimestampFallbacksByConversation.delete(oldestConversationId);
     }
 
     while (capturedTitlesByConversation.size > CAPTURED_CONVERSATION_CACHE_MAX) {
@@ -288,6 +315,20 @@
       if (capturedTimestampMapsByConversation.has(oldestConversationId)) {
         capturedTimestampMapsByConversation.delete(oldestConversationId);
       }
+      baselineMessageIdsByConversation.delete(oldestConversationId);
+      observedTimestampFallbacksByConversation.delete(oldestConversationId);
+    }
+
+    while (baselineMessageIdsByConversation.size > CAPTURED_CONVERSATION_CACHE_MAX) {
+      const oldestConversationId = baselineMessageIdsByConversation.keys().next().value;
+      baselineMessageIdsByConversation.delete(oldestConversationId);
+      observedTimestampFallbacksByConversation.delete(oldestConversationId);
+    }
+
+    while (observedTimestampFallbacksByConversation.size > CAPTURED_CONVERSATION_CACHE_MAX) {
+      const oldestConversationId = observedTimestampFallbacksByConversation.keys().next().value;
+      observedTimestampFallbacksByConversation.delete(oldestConversationId);
+      baselineMessageIdsByConversation.delete(oldestConversationId);
     }
   }
 
@@ -303,6 +344,70 @@
       return "";
     }
     return capturedTitlesByConversation.get(conversationId) || "";
+  }
+
+  function collectCurrentConversationMessageIdsFromDom() {
+    const out = new Set();
+    const nodes = document.querySelectorAll(
+      "article[data-testid^='conversation-turn-'] [data-message-author-role], article[data-turn-id] [data-message-author-role]"
+    );
+    nodes.forEach((messageNode, index) => {
+      const turn = messageNode.closest("article[data-testid^='conversation-turn-'], article[data-turn-id]");
+      const messageId = String(
+        messageNode.getAttribute("data-message-id") ||
+        turn?.getAttribute("data-turn-id") ||
+        ("dom-" + index)
+      ).trim();
+      if (messageId) {
+        out.add(messageId);
+      }
+    });
+    return out;
+  }
+
+  function ensureConversationBaselineMessageIds(conversationId) {
+    const id = String(conversationId || "").trim();
+    if (!id) {
+      return new Set();
+    }
+
+    if (baselineMessageIdsByConversation.has(id)) {
+      return baselineMessageIdsByConversation.get(id) || new Set();
+    }
+
+    const baseline = collectCurrentConversationMessageIdsFromDom();
+    baselineMessageIdsByConversation.set(id, baseline);
+    trimCapturedConversationCache();
+    return baseline;
+  }
+
+  function isBaselineMessageId(conversationId, messageId) {
+    const id = String(conversationId || "").trim();
+    const mid = String(messageId || "").trim();
+    if (!id || !mid) {
+      return false;
+    }
+    const baseline = baselineMessageIdsByConversation.get(id);
+    if (!(baseline instanceof Set)) {
+      return false;
+    }
+    return baseline.has(mid);
+  }
+
+  function getObservedTimestampFallbackMap(conversationId) {
+    const id = String(conversationId || "").trim();
+    if (!id) {
+      return null;
+    }
+
+    if (observedTimestampFallbacksByConversation.has(id)) {
+      return observedTimestampFallbacksByConversation.get(id) || null;
+    }
+
+    const map = new Map();
+    observedTimestampFallbacksByConversation.set(id, map);
+    trimCapturedConversationCache();
+    return map;
   }
 
   function installRuntimeListener() {
@@ -2407,17 +2512,110 @@ ${eventRows}
   async function collectMessages(progressCallback, options = {}) {
     const conversationId = getConversationIdFromPath() || "";
     await waitForCapturedConversationData(conversationId, 1400);
+    ensureConversationBaselineMessageIds(conversationId);
 
     progressCallback("Collecting messages from DOM...", "busy");
-    const domMessages = await collectMessagesFromDom(progressCallback, {
+    let domMessages = await collectMessagesFromDom(progressCallback, {
       allowExtendedWait: options?.allowExtendedWait !== false,
       isCancelled: typeof options?.isCancelled === "function" ? options.isCancelled : null
     });
+
+    if (conversationId && hasMessagesWithUnknownTimestamps(domMessages)) {
+      await tryRefreshCapturedConversationDataFromApi(conversationId, progressCallback);
+      const refreshedTimestampMap = getCapturedTimestampMap(conversationId);
+      if (refreshedTimestampMap && refreshedTimestampMap.size > 0) {
+        domMessages = applyCapturedTimestampsToMessages(domMessages, refreshedTimestampMap);
+      }
+    }
+
     return {
       source: "dom",
       conversationTitle: getCapturedConversationTitle(conversationId) || getConversationTitleFromPage(),
       messages: domMessages
     };
+  }
+
+  async function tryRefreshCapturedConversationDataFromApi(conversationId, progressCallback) {
+    const targetConversationId = String(conversationId || "").trim();
+    if (!targetConversationId) {
+      return false;
+    }
+
+    try {
+      if (typeof progressCallback === "function") {
+        progressCallback("Syncing fresh timestamps...", "busy");
+      }
+      const payload = await fetchConversationPayload(targetConversationId, progressCallback, {
+        timeoutMs: 25000,
+        maxRetries: 1,
+        contextLabel: "Timestamp sync"
+      });
+      const timestampMap = extractTimestampMapFromApiPayload(payload);
+      const title = sanitizeConversationTitle(payload?.title || "");
+      if (timestampMap.size === 0 && !title) {
+        return false;
+      }
+      rememberCapturedConversationData(targetConversationId, timestampMap, title);
+      return timestampMap.size > 0;
+    } catch (error) {
+      console.warn("[ChatGPT Export] Timestamp sync skipped:", error);
+      return false;
+    }
+  }
+
+  function hasMessagesWithUnknownTimestamps(messages) {
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return false;
+    }
+    for (let index = 0; index < messages.length; index += 1) {
+      if (!messageHasKnownTimestamp(messages[index])) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function messageHasKnownTimestamp(message) {
+    const iso = String(message?.timestampIso || "").trim();
+    if (iso) {
+      return true;
+    }
+    const display = String(message?.timestampDisplay || "").trim();
+    if (!display) {
+      return false;
+    }
+    return !/^unknown time$/i.test(display);
+  }
+
+  function applyCapturedTimestampsToMessages(messages, timestampMap) {
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return [];
+    }
+    if (!(timestampMap instanceof Map) || timestampMap.size === 0) {
+      return messages;
+    }
+
+    return messages.map((message) => {
+      if (messageHasKnownTimestamp(message)) {
+        return message;
+      }
+
+      const messageId = String(message?.id || "").trim();
+      if (!messageId) {
+        return message;
+      }
+
+      const timestampInfo = timestampMap.get(messageId);
+      if (!timestampInfo) {
+        return message;
+      }
+
+      return {
+        ...message,
+        timestampIso: String(timestampInfo.iso || "").trim(),
+        timestampDisplay: String(timestampInfo.display || "").trim() || "Unknown time"
+      };
+    });
   }
 
   async function waitForCapturedConversationData(conversationId, timeoutMs) {
@@ -4362,6 +4560,7 @@ ${eventRows}
 
     const collectNow = () => {
       const turns = document.querySelectorAll("article[data-testid^='conversation-turn-'], article[data-turn-id]");
+      const recentTurnCutoff = Math.max(0, turns.length - 8);
       turns.forEach((turn, turnIndex) => {
         const messageNodes = turn.querySelectorAll("[data-message-author-role]");
         const turnMessageIds = [];
@@ -4393,6 +4592,24 @@ ${eventRows}
                 iso: timestamp.toISOString(),
                 display: formatTimestamp(timestamp)
               };
+            }
+          }
+
+          if (!timestampInfo && conversationId && messageId) {
+            const observedFallbackMap = getObservedTimestampFallbackMap(conversationId);
+            const knownObserved = observedFallbackMap?.get(messageId) || null;
+            if (knownObserved) {
+              timestampInfo = knownObserved;
+            } else if (!isBaselineMessageId(conversationId, messageId) && turnIndex >= recentTurnCutoff) {
+              const now = new Date();
+              const generated = {
+                iso: now.toISOString(),
+                display: formatTimestamp(now)
+              };
+              if (observedFallbackMap) {
+                observedFallbackMap.set(messageId, generated);
+              }
+              timestampInfo = generated;
             }
           }
 
@@ -5375,6 +5592,13 @@ ${eventRows}
 
       const tag = String(node.tagName || "").toLowerCase();
       if (blockedTags.has(tag)) {
+        if (tag === "button") {
+          // ChatGPT wraps user-upload images in button-based lightbox triggers.
+          // Keep only nested images, discard interactive button chrome.
+          Array.from(node.querySelectorAll("img[src]")).forEach((imageNode) => {
+            sanitizeNode(imageNode, parent);
+          });
+        }
         return;
       }
       if (node.hasAttribute && node.hasAttribute(INLINE_TS_MARKER_ATTR)) {

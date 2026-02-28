@@ -4,7 +4,7 @@ Chrome extension (Manifest V3) to export ChatGPT conversations as standalone HTM
 
 ## Download
 - Release page: https://github.com/joelaniol/chatgpt_exporter/releases
-- Direct ZIP (v1.4.0): https://github.com/joelaniol/chatgpt_exporter/releases/download/v1.4.0/chatgpt_exporter-v1.4.0.zip
+- Direct ZIP (v1.4.1): https://github.com/joelaniol/chatgpt_exporter/releases/download/v1.4.1/chatgpt_exporter-v1.4.1.zip
 
 ## Features
 - Export the currently open ChatGPT conversation to HTML.
@@ -14,6 +14,11 @@ Chrome extension (Manifest V3) to export ChatGPT conversations as standalone HTM
 - Optional live debug checkpoint file during batch.
 - Full-size image embedding for backup-grade exports.
 - Click-to-open lightbox for images in exported HTML.
+
+## What's New In v1.4.1
+- Fixed: user-uploaded images wrapped inside ChatGPT lightbox buttons are now preserved and embedded in exports.
+- Fixed: `Single Save` no longer leaves newly added messages as `Unknown time` after the thread was already open.
+- Improved: timestamp handling is more robust when ChatGPT does not expose `<time>` nodes for fresh turns.
 
 ## Screenshots
 ![Export Dialog](media/screenshot-chatgpt-export-dialog.png)
