@@ -6,6 +6,11 @@ Chrome extension (Manifest V3) to export ChatGPT conversations as standalone HTM
 - Release page: https://github.com/joelaniol/chatgpt_exporter/releases
 - Direct ZIP (v1.4.1): https://github.com/joelaniol/chatgpt_exporter/releases/download/v1.4.1/chatgpt_exporter-v1.4.1.zip
 
+## Build Release ZIP (Local)
+- Run: `powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1`
+- Output: `release/chatgpt_exporter-v<version>.zip`
+- The script uses a strict allowlist and verifies there are no extra files in the ZIP.
+
 ## Features
 - Export the currently open ChatGPT conversation to HTML.
 - Batch export many/all conversations.
