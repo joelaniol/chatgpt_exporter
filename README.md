@@ -22,7 +22,6 @@ Chrome extension (Manifest V3) to export ChatGPT conversations as standalone HTM
 
 ## Screenshots
 ![Export Dialog](media/screenshot-chatgpt-export-dialog.png)
-![Store Screenshot](media/screenshot-store-1280x800.png)
 
 ## Promo Image
 ![ChatGPT Thread Exporter Promo](media/linkedin-chatgpt-exporter-v1.4.0.png)
