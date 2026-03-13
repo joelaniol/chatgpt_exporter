@@ -36,7 +36,7 @@ $allowed = @(
 )
 
 $releaseDir = Join-Path $repoRoot "release"
-$zipName = "chatgpt_exporter-v$Version.zip"
+$zipName = "save-gpt-chats-v$Version.zip"
 $zipPath = Join-Path $releaseDir $zipName
 $tmpDir = Join-Path $repoRoot ".tmp_release_package"
 

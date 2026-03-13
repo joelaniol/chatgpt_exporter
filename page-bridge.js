@@ -1,8 +1,13 @@
 (function initChatGptExportPageBridge() {
-  if (window.__chatgptExportPageBridgeInstalled__) {
-    return;
+  const BRIDGE_STATE_KEY = "__chatgptExportPageBridgeState__";
+  const previousState = window[BRIDGE_STATE_KEY];
+  if (previousState && typeof previousState.cleanup === "function") {
+    try {
+      previousState.cleanup();
+    } catch (_error) {
+      // Best effort cleanup of a stale bridge instance.
+    }
   }
-  window.__chatgptExportPageBridgeInstalled__ = true;
 
   const script = document.currentScript;
   const token = script?.dataset?.token || "";
@@ -11,10 +16,24 @@
   const payloadType = script?.dataset?.payloadType || "chatgpt-export-bridge-conversation-payload";
   const MAX_CAPTURED_JSON_BYTES = 14 * 1024 * 1024;
   const conversationPathPattern = /^\/backend-api\/conversations?\/([0-9a-zA-Z_-]{8,})\/?$/i;
+  const backendApiPattern = /^\/backend-api\//;
+  const state = {
+    token,
+    requestType,
+    responseType,
+    payloadType,
+    originalFetch: null,
+    patchedFetch: null,
+    messageHandler: null,
+    cleanup: null
+  };
+
+  window.__chatgptExportPageBridgeInstalled__ = true;
+  window[BRIDGE_STATE_KEY] = state;
 
   installConversationFetchTap();
 
-  window.addEventListener("message", async (event) => {
+  state.messageHandler = async (event) => {
     if (event.source !== window) {
       return;
     }
@@ -39,16 +58,24 @@
         ok: false,
         status: 0,
         statusText: "",
-        error: "ungueltige bridge request daten"
+        error: "Invalid bridge request data"
       }, "*");
       return;
     }
 
     try {
+      const mergedHeaders = Object.assign({}, options.headers || {});
+      if (isBackendApiUrl(url) && !mergedHeaders["Authorization"] && !mergedHeaders["authorization"]) {
+        const bearerToken = resolveAccessToken();
+        if (bearerToken) {
+          mergedHeaders["Authorization"] = "Bearer " + bearerToken;
+        }
+      }
+
       const response = await fetch(url, {
         method: options.method || "GET",
         credentials: options.credentials || "include",
-        headers: options.headers || {},
+        headers: mergedHeaders,
         body: typeof options.body === "string" ? options.body : undefined
       });
 
@@ -85,20 +112,35 @@
         error: String(error?.message || error)
       }, "*");
     }
-  });
+  };
 
-  function installConversationFetchTap() {
-    if (window.__chatgptExportConversationTapInstalled__) {
-      return;
+  window.addEventListener("message", state.messageHandler);
+
+  state.cleanup = () => {
+    if (state.messageHandler) {
+      window.removeEventListener("message", state.messageHandler);
     }
 
+    if (state.patchedFetch && state.originalFetch && window.fetch === state.patchedFetch) {
+      window.fetch = state.originalFetch;
+    }
+
+    if (window[BRIDGE_STATE_KEY] === state) {
+      delete window[BRIDGE_STATE_KEY];
+    }
+    window.__chatgptExportPageBridgeInstalled__ = false;
+    window.__chatgptExportConversationTapInstalled__ = false;
+  };
+
+  function installConversationFetchTap() {
     const originalFetch = window.fetch;
     if (typeof originalFetch !== "function") {
       return;
     }
+    state.originalFetch = originalFetch;
     window.__chatgptExportConversationTapInstalled__ = true;
 
-    window.fetch = function patchedChatgptExportFetch(input, init) {
+    state.patchedFetch = function patchedChatgptExportFetch(input, init) {
       const requestedUrl = resolveRequestUrl(input);
       const fetchPromise = originalFetch.call(this, input, init);
 
@@ -112,6 +154,8 @@
 
       return fetchPromise;
     };
+
+    window.fetch = state.patchedFetch;
   }
 
   function resolveRequestUrl(input) {
@@ -212,8 +256,11 @@
         continue;
       }
 
-      const id = String(message.id || node.id || "").trim();
-      if (!id) {
+      const ids = collectTimestampAliasKeys([
+        message?.id,
+        node?.id
+      ]);
+      if (ids.length === 0) {
         continue;
       }
 
@@ -224,7 +271,7 @@
       }
 
       timestamps.push({
-        id,
+        ids,
         create_time: createTime,
         update_time: updateTime
       });
@@ -235,5 +282,62 @@
       title: String(payload.title || "").trim(),
       timestamps
     };
+  }
+
+  function isBackendApiUrl(url) {
+    const absolute = toAbsoluteUrl(url);
+    if (!absolute) {
+      return false;
+    }
+    return backendApiPattern.test(absolute.pathname);
+  }
+
+  function resolveAccessToken() {
+    try {
+      const scripts = document.querySelectorAll('script[type="application/json"]');
+      for (let i = 0; i < scripts.length; i += 1) {
+        const text = scripts[i].textContent || "";
+        if (!text.includes("accessToken")) {
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(text);
+          const accessToken = parsed?.session?.accessToken;
+          if (typeof accessToken === "string" && accessToken.length > 0) {
+            return accessToken;
+          }
+        } catch (_parseError) {
+          // Continue to next script.
+        }
+      }
+    } catch (_error) {
+      // Token extraction is best-effort.
+    }
+    return "";
+  }
+
+  function collectTimestampAliasKeys(rawCandidates) {
+    const keys = [];
+    const seen = new Set();
+    const queue = Array.isArray(rawCandidates) ? rawCandidates : [rawCandidates];
+
+    const pushKey = (value) => {
+      const normalized = String(value || "").trim();
+      if (!normalized || seen.has(normalized)) {
+        return;
+      }
+      seen.add(normalized);
+      keys.push(normalized);
+    };
+
+    queue.forEach((candidate) => {
+      if (Array.isArray(candidate)) {
+        candidate.forEach(pushKey);
+        return;
+      }
+      pushKey(candidate);
+    });
+
+    return keys;
   }
 })();

@@ -11,6 +11,7 @@
 
   const STYLE_ID = "chatgpt-thread-export-style";
   const STATUS_ID = "chatgpt-thread-export-status";
+  const INTERACTION_GUARD_ID = "chatgpt-thread-export-guard";
   const INLINE_TS_CLASS = "chatgpt-inline-timestamp";
   const INLINE_TS_MARKER_ATTR = "data-chatgpt-export-inline-ts";
   const INLINE_TS_STORAGE_KEY = "__chatgpt_export_inline_timestamps__";
@@ -20,6 +21,8 @@
   const PAGE_BRIDGE_PAYLOAD_TYPE = "chatgpt-export-bridge-conversation-payload";
   const PAGE_BRIDGE_TOKEN = "tok_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
   const CAPTURED_CONVERSATION_CACHE_MAX = 8;
+  const SINGLE_EXPORT_PENDING_RESUME_STORAGE_KEY = "__chatgpt_export_single_pending_resume__";
+  const SINGLE_EXPORT_PENDING_RESUME_MAX_AGE_MS = 10 * 60 * 1000;
 
   const API_TIMEOUT_MS = 240000;
   const API_MAX_RETRIES = 4;
@@ -32,7 +35,6 @@
   const BATCH_DOWNLOAD_DELAY_MS = 600;
   const BATCH_MAX_PAGES = 400;
   const EXPORT_BASE_FOLDER_NAME = "Chat GPT";
-  const RUNTIME_STATE_STORAGE_KEY = "__chatgpt_export_runtime_state__";
   const RUNTIME_STATE_WRITE_THROTTLE_MS = 450;
   const RUNTIME_STATE_HEARTBEAT_MS = 3000;
   const BATCH_STATE_STORAGE_KEY = "__chatgpt_export_batch_state__";
@@ -62,6 +64,15 @@
   const DOM_LONG_WAIT_POLL_MS = 800;
   const DOM_LONG_WAIT_RESCAN_LIMIT = 2;
   const DOM_LONG_WAIT_NO_ACTIVITY_EXIT_MS = 7000;
+  const SINGLE_EXPORT_COLLECTION_MAX_ATTEMPTS = 3;
+  const SINGLE_EXPORT_RETRY_DELAY_MS = 1200;
+  const SINGLE_HIDDEN_WAIT_MAX_MS = 45000;
+  const SINGLE_HIDDEN_NOTICE_MS = 5000;
+  const SINGLE_EXPORT_AUTO_RESUME_DELAY_MS = 700;
+  const SINGLE_EXPORT_STABILITY_WAIT_MAX_MS = 30000;
+  const SINGLE_EXPORT_STABILITY_POLL_MS = 800;
+  const SINGLE_EXPORT_STABILITY_STABLE_PASSES = 2;
+  const SINGLE_EXPORT_TIMESTAMP_RELOAD_MAX_ATTEMPTS = 1;
   const SIDEBAR_SWEEP_MAX_PASSES = 220;
   const SIDEBAR_SWEEP_MAX_PASSES_CAP = 5000;
   const SIDEBAR_SWEEP_SETTLE_MS = 260;
@@ -100,14 +111,24 @@
   let runtimeStatusKind = "";
   let runtimeStatusUpdatedAt = 0;
   let runtimeOperation = "";
+  let runtimeExportFormat = "html";
+  let runtimeDetailedMetadata = false;
   let runtimeStartedAt = 0;
   let runtimeHeartbeatTimer = null;
   let runtimeStateFlushTimer = null;
+  let singleExportInteractionGuardActive = false;
+  let singleExportPendingResume = null;
+  let singleExportResumeTimer = null;
+  let singleExportResumeAttemptInFlight = false;
+  let singleExportResumeGeneration = 0;
 
   boot();
 
   function boot() {
     injectStyles();
+    installSingleExportInteractionGuard();
+    installSingleExportAutoResumeListener();
+    installRuntimeStateCleanupListener();
     installPagePayloadListener();
     installRuntimeListener();
     void ensurePageBridge().catch((error) => {
@@ -115,6 +136,7 @@
     });
     scheduleInitialConversationBaselineCapture();
     removeInlineTimestampBadges();
+    restoreSingleExportPendingResumeFromStorage();
     scheduleBatchAutoResume();
     persistRuntimeState(true);
   }
@@ -197,7 +219,7 @@
       void refreshInlineTimestamps(wantsStatus).catch((error) => {
         console.error("[ChatGPT Export] Inline refresh crashed:", error);
         if (wantsStatus) {
-          setStatus("Inline timestamp error, please reload.", "error", 4200);
+          setStatus("Message times could not be refreshed. Reload the page.", "error", 4200);
         }
       });
     }, 50);
@@ -211,7 +233,7 @@
 
     renderInlineTimestampBadges();
     if (showStatus) {
-      setStatus("Inline timestamps refreshed.", "success", 2600);
+      setStatus("Message times updated.", "success", 2600);
     }
   }
 
@@ -252,9 +274,15 @@
     }
 
     rawTimestamps.forEach((item, index) => {
-      const rawId = item?.id ?? item?.message_id ?? item?.messageId ?? "";
-      const messageId = String(rawId || "").trim() || ("msg-" + index);
-      if (!messageId) {
+      const timestampKeys = collectTimestampAliasKeys([
+        item?.ids,
+        item?.id,
+        item?.message_id,
+        item?.messageId,
+        item?.node_id,
+        item?.nodeId
+      ], "msg-" + index);
+      if (timestampKeys.length === 0) {
         return;
       }
 
@@ -263,13 +291,93 @@
         return;
       }
 
-      out.set(messageId, {
+      const timestampInfo = {
         iso: timestamp.toISOString(),
         display: formatTimestamp(timestamp)
+      };
+
+      timestampKeys.forEach((messageId) => {
+        out.set(messageId, timestampInfo);
       });
     });
 
     return out;
+  }
+
+  function collectTimestampAliasKeys(rawCandidates, fallbackId = "") {
+    const keys = [];
+    const seen = new Set();
+    const queue = Array.isArray(rawCandidates) ? rawCandidates : [rawCandidates];
+
+    const pushKey = (value) => {
+      const normalized = String(value || "").trim();
+      if (!normalized || seen.has(normalized)) {
+        return;
+      }
+      seen.add(normalized);
+      keys.push(normalized);
+    };
+
+    queue.forEach((candidate) => {
+      if (Array.isArray(candidate)) {
+        candidate.forEach(pushKey);
+        return;
+      }
+      pushKey(candidate);
+    });
+
+    if (keys.length === 0) {
+      pushKey(fallbackId);
+    }
+
+    return keys;
+  }
+
+  function normalizePotentialMessageId(value) {
+    const raw = String(value || "").trim();
+    if (!raw || /\s/.test(raw)) {
+      return "";
+    }
+
+    const testIdMatch = /(?:^|[-_:])conversation-turn-([0-9a-zA-Z_-]{8,})$/i.exec(raw);
+    if (testIdMatch) {
+      return String(testIdMatch[1] || "").trim();
+    }
+
+    if (/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(raw)) {
+      return raw;
+    }
+
+    if (/^[0-9a-zA-Z_-]{16,}$/.test(raw)) {
+      return raw;
+    }
+
+    return "";
+  }
+
+  function getDomMessageId(messageNode, turn, fallbackId = "") {
+    const candidates = [
+      messageNode?.getAttribute?.("data-message-id"),
+      messageNode?.dataset?.messageId,
+      messageNode?.getAttribute?.("data-id"),
+      messageNode?.id,
+      messageNode?.getAttribute?.("data-testid"),
+      turn?.getAttribute?.("data-message-id"),
+      turn?.dataset?.messageId,
+      turn?.getAttribute?.("data-turn-id"),
+      turn?.getAttribute?.("data-id"),
+      turn?.id,
+      turn?.getAttribute?.("data-testid")
+    ];
+
+    for (let index = 0; index < candidates.length; index += 1) {
+      const normalized = normalizePotentialMessageId(candidates[index]);
+      if (normalized) {
+        return normalized;
+      }
+    }
+
+    return String(fallbackId || "").trim();
   }
 
   function rememberCapturedConversationData(conversationId, timestampMap, title) {
@@ -353,11 +461,7 @@
     );
     nodes.forEach((messageNode, index) => {
       const turn = messageNode.closest("article[data-testid^='conversation-turn-'], article[data-turn-id]");
-      const messageId = String(
-        messageNode.getAttribute("data-message-id") ||
-        turn?.getAttribute("data-turn-id") ||
-        ("dom-" + index)
-      ).trim();
+      const messageId = getDomMessageId(messageNode, turn, "dom-" + index);
       if (messageId) {
         out.add(messageId);
       }
@@ -410,6 +514,50 @@
     return map;
   }
 
+  function cloneTimestampInfoMap(timestampMap) {
+    if (!(timestampMap instanceof Map) || timestampMap.size <= 0) {
+      return new Map();
+    }
+
+    const out = new Map();
+    timestampMap.forEach((value, key) => {
+      const normalizedKey = String(key || "").trim();
+      if (!normalizedKey || !value || typeof value !== "object") {
+        return;
+      }
+
+      const iso = String(value.iso || "").trim();
+      const display = String(value.display || "").trim() || "Unknown time";
+      out.set(normalizedKey, { iso, display });
+    });
+    return out;
+  }
+
+  function replaceObservedTimestampFallbackMap(conversationId, timestampMap) {
+    const id = String(conversationId || "").trim();
+    if (!id) {
+      return;
+    }
+
+    const nextMap = cloneTimestampInfoMap(timestampMap);
+    const capturedMap = getCapturedTimestampMap(id);
+    if (capturedMap instanceof Map && capturedMap.size > 0) {
+      capturedMap.forEach((_value, messageId) => {
+        const normalizedMessageId = String(messageId || "").trim();
+        if (normalizedMessageId) {
+          nextMap.delete(normalizedMessageId);
+        }
+      });
+    }
+
+    if (nextMap.size > 0) {
+      observedTimestampFallbacksByConversation.set(id, nextMap);
+    } else {
+      observedTimestampFallbacksByConversation.delete(id);
+    }
+    trimCapturedConversationCache();
+  }
+
   function installRuntimeListener() {
     if (!chrome?.runtime?.onMessage) {
       return;
@@ -424,7 +572,7 @@
         sendResponse({
           ok: true,
           isConversationPage: isConversationPage(),
-          isExporting,
+          isExporting: Boolean(runtimeState.isExporting),
           showInlineTimestamps: false,
           batchYearFolderOnly,
           batchDebugLogEnabled,
@@ -434,12 +582,16 @@
           runtimeStatusKind: runtimeState.statusKind,
           runtimeStatusUpdatedAt: runtimeState.statusUpdatedAt,
           runtimeOperation: runtimeState.operation,
+          runtimeExportFormat: runtimeState.exportFormat,
+          runtimeDetailedMetadata: Boolean(runtimeState.detailedMetadata),
           runtimeStartedAt: runtimeState.startedAt,
           batchTotalCount: runtimeState.batchTotalCount,
           batchDoneCount: runtimeState.batchDoneCount,
           batchSuccessCount: runtimeState.batchSuccessCount,
           batchFailureCount: runtimeState.batchFailureCount,
-          batchSkippedCount: runtimeState.batchSkippedCount
+          batchSkippedCount: runtimeState.batchSkippedCount,
+          batchExportFormat: runtimeState.batchExportFormat,
+          batchDetailedMetadata: Boolean(runtimeState.batchDetailedMetadata)
         });
         return false;
       }
@@ -457,23 +609,25 @@
 
       if (type === "chatgpt-export-trigger") {
         if (isExporting) {
-          sendResponse({ ok: false, error: "Export is already running." });
+          sendResponse({ ok: false, error: "A save is already running." });
           return false;
         }
         if (!isConversationPage()) {
-          sendResponse({ ok: false, error: "Please open a chat thread (/c/...)." });
+          sendResponse({ ok: false, error: "Open one ChatGPT chat first." });
           return false;
         }
-        void startExport("action").catch((error) => {
+        const exportFormat = normalizeSingleExportFormat(message?.format);
+        const detailedMetadata = normalizeDetailedMetadataOption(message?.detailedMetadata, exportFormat);
+        void startExport("action", { format: exportFormat, detailedMetadata }).catch((error) => {
           console.error("[ChatGPT Export] Action export failed:", error);
         });
-        sendResponse({ ok: true, started: true });
+        sendResponse({ ok: true, started: true, format: exportFormat, detailedMetadata });
         return false;
       }
 
       if (type === "chatgpt-export-batch-trigger") {
         if (isExporting) {
-          sendResponse({ ok: false, error: "Export is already running." });
+          sendResponse({ ok: false, error: "A save is already running." });
           return false;
         }
         void startBatchExport("action", message?.options || {}).catch((error) => {
@@ -485,7 +639,7 @@
 
       if (type === "chatgpt-export-batch-resume-trigger") {
         if (isExporting) {
-          sendResponse({ ok: false, error: "Export is already running." });
+          sendResponse({ ok: false, error: "A save is already running." });
           return false;
         }
         void resumeBatchExport("action").catch((error) => {
@@ -544,6 +698,18 @@
     });
   }
 
+  function installSingleExportAutoResumeListener() {
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        scheduleSingleExportAutoResumeAttempt();
+      }
+    });
+
+    window.addEventListener("focus", () => {
+      scheduleSingleExportAutoResumeAttempt();
+    });
+  }
+
   function injectStyles() {
     if (document.getElementById(STYLE_ID)) {
       return;
@@ -581,6 +747,31 @@
         border-color: rgba(248, 113, 113, 0.75);
       }
 
+      #${INTERACTION_GUARD_ID} {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483646;
+        display: none;
+        align-items: flex-start;
+        justify-content: flex-end;
+        padding: 18px;
+        background: rgba(15, 23, 42, 0.10);
+        backdrop-filter: blur(1px);
+        pointer-events: auto;
+        cursor: progress;
+      }
+
+      #${INTERACTION_GUARD_ID} .guard-card {
+        max-width: min(340px, calc(100vw - 36px));
+        padding: 12px 14px;
+        border-radius: 14px;
+        border: 1px solid rgba(100, 116, 139, 0.55);
+        background: rgba(15, 23, 42, 0.94);
+        color: #e2e8f0;
+        font: 600 12px/1.45 "Segoe UI", Arial, sans-serif;
+        box-shadow: 0 12px 28px rgba(2, 6, 23, 0.32);
+      }
+
       .${INLINE_TS_CLASS} {
         margin: 0 0 6px;
         padding: 4px 8px;
@@ -612,6 +803,136 @@
     return status;
   }
 
+  function installSingleExportInteractionGuard() {
+    const shouldIgnoreGuardKey = (event) => {
+      const key = String(event?.key || "");
+      return key === "Shift" || key === "Control" || key === "Alt" || key === "Meta";
+    };
+
+    const blockGuardEvent = (event) => {
+      if (!singleExportInteractionGuardActive) {
+        return;
+      }
+
+      if (event.type.startsWith("key") && shouldIgnoreGuardKey(event)) {
+        return;
+      }
+
+      if (typeof event.preventDefault === "function" && event.cancelable) {
+        event.preventDefault();
+      }
+      if (typeof event.stopImmediatePropagation === "function") {
+        event.stopImmediatePropagation();
+      } else if (typeof event.stopPropagation === "function") {
+        event.stopPropagation();
+      }
+
+      const guard = document.getElementById(INTERACTION_GUARD_ID);
+      if (guard && document.activeElement !== guard && typeof guard.focus === "function") {
+        guard.focus({ preventScroll: true });
+      }
+    };
+
+    const enforceGuardFocus = (event) => {
+      if (!singleExportInteractionGuardActive) {
+        return;
+      }
+
+      const guard = document.getElementById(INTERACTION_GUARD_ID);
+      if (!guard) {
+        return;
+      }
+
+      const target = event?.target;
+      if (target === guard || (guard.contains && guard.contains(target))) {
+        return;
+      }
+
+      if (target && typeof target.blur === "function") {
+        target.blur();
+      }
+      if (typeof guard.focus === "function") {
+        guard.focus({ preventScroll: true });
+      }
+      if (typeof event.stopImmediatePropagation === "function") {
+        event.stopImmediatePropagation();
+      } else if (typeof event.stopPropagation === "function") {
+        event.stopPropagation();
+      }
+    };
+
+    window.addEventListener("keydown", blockGuardEvent, true);
+    window.addEventListener("keypress", blockGuardEvent, true);
+    window.addEventListener("keyup", blockGuardEvent, true);
+    document.addEventListener("beforeinput", blockGuardEvent, true);
+    document.addEventListener("input", blockGuardEvent, true);
+    document.addEventListener("focusin", enforceGuardFocus, true);
+  }
+
+  function ensureSingleExportInteractionGuard() {
+    if (!document.body) {
+      return null;
+    }
+
+    let guard = document.getElementById(INTERACTION_GUARD_ID);
+    if (!guard) {
+      guard = document.createElement("div");
+      guard.id = INTERACTION_GUARD_ID;
+      guard.setAttribute("aria-hidden", "true");
+      guard.tabIndex = -1;
+      guard.innerHTML = '<div class="guard-card"></div>';
+
+      const blockEvent = (event) => {
+        if (event.cancelable) {
+          event.preventDefault();
+        }
+        if (typeof event.stopImmediatePropagation === "function") {
+          event.stopImmediatePropagation();
+        } else {
+          event.stopPropagation();
+        }
+      };
+      guard.addEventListener("click", blockEvent, true);
+      guard.addEventListener("mousedown", blockEvent, true);
+      guard.addEventListener("mouseup", blockEvent, true);
+      guard.addEventListener("pointerdown", blockEvent, true);
+      guard.addEventListener("pointerup", blockEvent, true);
+      guard.addEventListener("wheel", blockEvent, { capture: true, passive: false });
+      guard.addEventListener("touchmove", blockEvent, { capture: true, passive: false });
+      guard.addEventListener("touchstart", blockEvent, { capture: true, passive: false });
+      guard.addEventListener("contextmenu", blockEvent, true);
+
+      document.body.appendChild(guard);
+    }
+
+    return guard;
+  }
+
+  function setSingleExportInteractionGuardActive(active, message = "") {
+    singleExportInteractionGuardActive = Boolean(active);
+    const guard = ensureSingleExportInteractionGuard();
+    if (!guard) {
+      return;
+    }
+
+    const card = guard.querySelector(".guard-card");
+    if (singleExportInteractionGuardActive) {
+      if (document.activeElement && typeof document.activeElement.blur === "function") {
+        document.activeElement.blur();
+      }
+      if (card) {
+        card.textContent = String(message || "Saving this chat. Please wait and keep this tab visible.");
+      }
+      guard.style.display = "flex";
+      if (typeof guard.focus === "function") {
+        guard.focus({ preventScroll: true });
+      }
+      return;
+    }
+
+    guard.style.display = "none";
+  }
+
   function setStatus(message, kind = "busy", hideAfterMs = 0) {
     const status = ensureStatusToast();
     runtimeStatusMessage = String(message || "");
@@ -637,29 +958,42 @@
     }
   }
 
-  async function startExport(triggerSource) {
+  async function startExport(triggerSource, options = {}) {
+    if (triggerSource !== "auto-resume") {
+      clearSingleExportPendingResume();
+    }
+
     if (isExporting) {
-      setStatus("Export is already running...", "busy", 2400);
+      setStatus("A save is already running...", "busy", 2400);
       return;
     }
 
     if (!isConversationPage()) {
-      setStatus("Please open a chat thread first.", "error", 7000);
+      setStatus("Open one chat first.", "error", 7000);
       return;
     }
 
     isExporting = true;
     exportCancelRequested = false;
-    setExportLifecycleActive("single");
+    const exportFormat = normalizeSingleExportFormat(options?.format);
+    const detailedMetadata = normalizeDetailedMetadataOption(options?.detailedMetadata, exportFormat);
+    setExportLifecycleActive("single", { format: exportFormat, detailedMetadata });
+    const formatLabel = getSingleExportFormatLabel(exportFormat);
+    const routeGuard = createSingleExportRouteGuard();
 
     try {
-      setStatus("Starting export...", "busy");
+      const exportPageUrl = routeGuard.pageUrl || String(window.location.href || "");
+      setStatus("Preparing " + formatLabel + " file...", "busy");
 
-      const fallbackTitle = getConversationTitleFromPage();
-      const exportResult = await collectMessages(setStatus, {
+      const fallbackTitle = routeGuard.title || getConversationTitleFromPage();
+      const exportResult = await collectMessagesWithIntegrityRetry(setStatus, {
         allowExtendedWait: true,
-        isCancelled: () => exportCancelRequested
+        allowTimestampBootstrapReload: triggerSource !== "auto-resume",
+        isCancelled: () => exportCancelRequested,
+        routeGuard,
+        formatLabel
       });
+      assertSingleExportRouteGuard(routeGuard);
 
       if (!Array.isArray(exportResult.messages) || exportResult.messages.length === 0) {
         throw new Error("No exportable messages found.");
@@ -667,38 +1001,77 @@
 
       const finalTitle = exportResult.conversationTitle || fallbackTitle;
       const exportedAt = new Date();
-      const preparedMessages = await prepareMessagesForHtmlExport(exportResult.messages);
-      assertExportableConversationMessages(preparedMessages);
-      const threadStartedAt = resolveConversationStartedAt(preparedMessages);
-      const html = buildHtmlDocument({
+      assertExportableConversationMessages(exportResult.messages);
+      const threadStartedAt = resolveConversationStartedAt(exportResult.messages);
+      const artifact = await buildSingleExportArtifact({
+        format: exportFormat,
+        detailedMetadata,
         title: finalTitle,
         source: exportResult.source,
-        messages: preparedMessages,
+        messages: exportResult.messages,
         exportedAt,
         threadStartedAt,
-        pageUrl: window.location.href
+        pageUrl: exportPageUrl
       });
 
-      const fileName = buildFileName(finalTitle, threadStartedAt);
-
-      setStatus("Downloading file...", "busy");
-      await triggerBrowserDownload(html, fileName, {
+      setStatus("Saving " + artifact.label + " file...", "busy");
+      await triggerBrowserDownload(artifact.content, artifact.fileName, {
+        mimeType: artifact.mimeType,
         subdirectory: EXPORT_BASE_FOLDER_NAME
       });
 
-      const sourceLabel = "DOM";
       setStatus(
-        "Saved: " + fileName + " (" + sourceLabel + ", " + preparedMessages.length + " Messages)",
+        "Saved: " + artifact.fileName + " (" + artifact.messageCount + " messages, " + artifact.label + ")",
         "success",
         9000
       );
     } catch (error) {
       if (isExportCancelledError(error)) {
-        setStatus("Export stopped.", "success", 5000);
+        setStatus("Save stopped.", "success", 5000);
+        return;
+      }
+      if (isSingleExportHiddenTimeoutError(error)) {
+        setSingleExportPendingResume({
+          format: exportFormat,
+          detailedMetadata,
+          routeGuard
+        });
+        setStatus(
+          "This ChatGPT tab was hidden too long. Trying to resume when it becomes visible again...",
+          "busy"
+        );
+        return;
+      }
+      if (isSingleExportReloadRequiredError(error) && triggerSource !== "auto-resume") {
+        setSingleExportPendingResume({
+          format: exportFormat,
+          detailedMetadata,
+          routeGuard,
+          reloadForTimestamps: true,
+          reloadAttempts: 1
+        });
+        setStatus("Reloading this chat once so message times can be captured...", "busy");
+        window.location.reload();
+        return;
+      }
+      if (isExportIntegrityError(error)) {
+        setStatus(
+          "The chat did not stay stable long enough for a safe backup. No file was saved. Please keep the tab visible and try again.",
+          "error",
+          12000
+        );
+        return;
+      }
+      if (isExportContextChangedError(error)) {
+        setStatus(
+          "The chat changed during the save. Please stay on the same chat until it finishes, then try again.",
+          "error",
+          12000
+        );
         return;
       }
       console.error("[ChatGPT Export] Export failed:", error);
-      setStatus("Export error: " + (error?.message || String(error)), "error", 12000);
+      setStatus("Could not save: " + (error?.message || String(error)), "error", 12000);
       throw error;
     } finally {
       isExporting = false;
@@ -713,42 +1086,53 @@
 
   async function startBatchExport(triggerSource, options = {}) {
     void triggerSource;
+    clearSingleExportPendingResume();
     if (isExporting) {
-      setStatus("Export is already running...", "busy", 2400);
+      setStatus("A save is already running...", "busy", 2400);
       return;
     }
 
+    const batchOptions = normalizeBatchExportOptions(options);
     const savedBatchState = loadBatchState();
     if (hasResumableBatchState(savedBatchState)) {
-      const shouldResume = window.confirm(
-        "A paused batch was found.\nOK = resume\nCancel = start new"
-      );
-      if (shouldResume) {
-        await startBatchExportFromState(savedBatchState, "resume");
-        return;
+      if (!batchOptions.startFresh) {
+        const shouldResume = window.confirm(
+          "A paused multi-chat save was found.\n\nOK = continue\nCancel = start over"
+        );
+        if (shouldResume) {
+          await startBatchExportFromState(savedBatchState, "resume");
+          return;
+        }
       }
       clearBatchState();
     }
-
-    const batchOptions = normalizeBatchExportOptions(options);
     batchYearFolderOnly = batchOptions.yearOnlyFolder;
     batchDebugLogEnabled = batchOptions.debugLogEnabled;
     persistBatchYearFolderOnlyState(batchYearFolderOnly);
     persistBatchDebugLogState(batchDebugLogEnabled);
+    isExporting = true;
+    exportCancelRequested = false;
+    setExportLifecycleActive("batch", {
+      format: batchOptions.format,
+      detailedMetadata: batchOptions.detailedMetadata
+    });
 
     const reportStatus = (message, kind = "busy", hideAfterMs = 0) => {
       setStatus(message, kind, hideAfterMs);
     };
+    let handedOffToBatchRun = false;
 
     try {
-      reportStatus("Batch: Loading thread list...", "busy");
+      reportStatus("Loading your chat list...", "busy");
+      throwIfExportCancelled(() => exportCancelRequested);
 
       const firstPayload = await fetchConversationListPage(0, BATCH_LIST_PAGE_LIMIT, reportStatus);
+      throwIfExportCancelled(() => exportCancelRequested);
       let firstPage = normalizeConversationListPage(firstPayload, 0, BATCH_LIST_PAGE_LIMIT);
       if (!firstPage.items || firstPage.items.length === 0) {
         const domFallbackItems = collectConversationMetasFromVisibleLinks();
         if (domFallbackItems.length > 0) {
-          reportStatus("Batch: API list empty, using visible thread links...", "busy");
+          reportStatus("Could not load the full chat list. Using the chats already visible on screen...", "busy");
           firstPage = {
             items: domFallbackItems,
             total: domFallbackItems.length,
@@ -763,7 +1147,7 @@
             payloadType: typeof firstPayload,
             topLevelKeys
           });
-          throw new Error("No threads found.");
+          throw new Error("No chats were found.");
         }
       }
 
@@ -777,44 +1161,60 @@
       }
 
       if (requestedCount == null) {
-        reportStatus("Batch cancelled.", "success", 3200);
+        reportStatus("Multi-chat save cancelled.", "success", 3200);
         return;
       }
 
-      reportStatus("Batch: Collecting thread list...", "busy");
-      const metaResult = await collectConversationMetasForBatch(requestedCount, firstPage, reportStatus);
+      reportStatus("Building your chat list...", "busy");
+      throwIfExportCancelled(() => exportCancelRequested);
+      const metaResult = await collectConversationMetasForBatch(requestedCount, firstPage, reportStatus, {
+        isCancelled: () => exportCancelRequested
+      });
+      throwIfExportCancelled(() => exportCancelRequested);
       const items = Array.isArray(metaResult?.items) ? metaResult.items : [];
       if (items.length === 0) {
-        throw new Error("No threads found for batch export.");
+        throw new Error("No chats were found to save.");
       }
 
       const state = initializeBatchState(items, batchOptions);
       saveBatchState(state);
 
-      await runBatchExportState(state);
+      handedOffToBatchRun = true;
+      await runBatchExportState(state, { alreadyActive: true });
     } catch (error) {
+      if (isExportCancelledError(error)) {
+        setStatus("Multi-chat save cancelled.", "success", 5000);
+        return;
+      }
       console.error("[ChatGPT Export] Batch start crashed:", error);
       if (error?.code === "sidebar_hidden_timeout") {
         setStatus(
-          "Batch start paused: sidebar could not reliably load in background. Keep the ChatGPT tab in the foreground and start again.",
+          "Could not load your chat list while the tab was hidden. Keep this ChatGPT tab visible and try again.",
           "error",
           14000
         );
         return;
       }
-      setStatus("Batch export error: " + (error?.message || String(error)), "error", 12000);
+      setStatus("Could not save many chats: " + (error?.message || String(error)), "error", 12000);
+    } finally {
+      if (!handedOffToBatchRun) {
+        isExporting = false;
+        exportCancelRequested = false;
+        setExportLifecycleIdle();
+      }
     }
   }
 
   async function resumeBatchExport(triggerSource) {
     void triggerSource;
+    clearSingleExportPendingResume();
     if (isExporting) {
-      setStatus("Export is already running...", "busy", 2400);
+      setStatus("A save is already running...", "busy", 2400);
       return;
     }
     const savedState = loadBatchState();
     if (!hasResumableBatchState(savedState)) {
-      setStatus("No paused batch found.", "error", 5000);
+      setStatus("There is no paused multi-chat save.", "error", 5000);
       return;
     }
     await startBatchExportFromState(savedState, "resume");
@@ -824,26 +1224,33 @@
     void source;
     const normalizedState = normalizeStoredBatchState(savedState);
     if (!hasResumableBatchState(normalizedState)) {
-      setStatus("No resumable batch available.", "error", 5000);
+      setStatus("There is no paused multi-chat save to continue.", "error", 5000);
       return;
     }
     await runBatchExportState(normalizedState);
   }
 
-  async function runBatchExportState(state) {
+  async function runBatchExportState(state, options = {}) {
     if (!state || !Array.isArray(state.items) || state.items.length === 0) {
       throw new Error("Invalid batch state.");
     }
-    if (isExporting) {
-      setStatus("Export is already running...", "busy", 2400);
+    if (isExporting && !options?.alreadyActive) {
+      setStatus("A save is already running...", "busy", 2400);
       return;
     }
 
-    isExporting = true;
-    exportCancelRequested = false;
+    if (!options?.alreadyActive) {
+      isExporting = true;
+      exportCancelRequested = false;
+    }
     batchDebugLogEnabled = Boolean(state?.options?.debugLogEnabled);
     persistBatchDebugLogState(batchDebugLogEnabled);
-    setExportLifecycleActive("batch");
+    if (!options?.alreadyActive) {
+      setExportLifecycleActive("batch", {
+        format: normalizeSingleExportFormat(state?.options?.format),
+        detailedMetadata: normalizeDetailedMetadataOption(state?.options?.detailedMetadata, state?.options?.format)
+      });
+    }
 
     const totalCount = state.items.length;
     const usedFileNames = new Set(Array.isArray(state.usedFileNames) ? state.usedFileNames : []);
@@ -864,12 +1271,13 @@
       appendBatchDebugEvent(context, {
         level: "info",
         code: "batch_started",
-        message: "Batch started.",
+        message: "Multi-chat save started.",
         position: Math.max(1, Number(state.nextIndex) + 1 || 1),
         extra: {
           totalCount,
           accountName: state?.options?.accountName || "",
-          yearOnlyFolder: Boolean(state?.options?.yearOnlyFolder)
+          yearOnlyFolder: Boolean(state?.options?.yearOnlyFolder),
+          format: normalizeSingleExportFormat(state?.options?.format)
         }
       });
       await maybeFlushBatchDebugLog(context, {
@@ -899,7 +1307,7 @@
           appendBatchDebugEvent(context, {
             level: "warn",
             code: "batch_paused_hidden_tab",
-            message: "Batch paused: ChatGPT tab stayed in background too long.",
+            message: "Multi-chat save paused because the ChatGPT tab was hidden too long.",
             position,
             meta
           });
@@ -915,15 +1323,14 @@
           appendBatchDebugEvent(context, {
             level: "info",
             code: "thread_started",
-            message: "Exporting thread.",
+            message: "Saving chat.",
             position,
             meta
           });
           setStatus(
-            "Batch " + indexLabel + " | " + doneBefore + "/" + totalCount +
-            " completed: Loading \"" + shortenTitle(safeTitle, 52) + "\"...",
-            "busy"
-          );
+              "Chat " + indexLabel + ": opening \"" + shortenTitle(safeTitle, 52) + "\"...",
+              "busy"
+            );
           let abortedCurrentItem = false;
           let failureKind = "";
 
@@ -933,7 +1340,7 @@
             appendBatchDebugEvent(context, {
               level: "info",
               code: "thread_exported",
-              message: "Thread saved.",
+              message: "Chat saved.",
               position,
               meta,
               extra: {
@@ -943,22 +1350,36 @@
             });
             const doneAfter = getBatchCompletedCount(state, totalCount);
             setStatus(
-              "Batch " + indexLabel + " | " + doneAfter + "/" + totalCount +
-              " completed: Saved \"" + shortenTitle(exportResult.fileName, 56) + "\" (" + exportResult.source + ")",
+              "Chat " + indexLabel + ": saved \"" + shortenTitle(exportResult.fileName, 56) + "\"",
               "success"
             );
           } catch (error) {
             if (isExportCancelledError(error)) {
               context.cancelRequested = true;
               abortedCurrentItem = true;
-              setStatus("Stop requested. Export will pause...", "busy");
+              setStatus("Stop requested. The current chat will finish first...", "busy");
+            } else if (isSingleExportHiddenTimeoutError(error)) {
+              context.cancelRequested = true;
+              context.pauseReason = "hidden_tab_timeout";
+              abortedCurrentItem = true;
+              setStatus(
+                "Chat " + indexLabel + ": pausing because this ChatGPT tab was hidden too long.",
+                "busy"
+              );
+            } else if (isExportContextChangedError(error)) {
+              context.cancelRequested = true;
+              context.pauseReason = "context_changed";
+              abortedCurrentItem = true;
+              setStatus(
+                "Chat " + indexLabel + ": the open chat changed. Return to this ChatGPT tab, then continue saving.",
+                "busy"
+              );
             } else if (isConversationNotFoundError(error)) {
               failureKind = "not_found";
               state.skippedCount += 1;
               const doneAfter = getBatchCompletedCount(state, totalCount);
               setStatus(
-                "Batch " + indexLabel + " | " + doneAfter + "/" + totalCount +
-                " completed: Thread not found (404).",
+                "Chat " + indexLabel + ": this chat could not be opened.",
                 "error"
               );
             } else {
@@ -966,8 +1387,7 @@
               state.failureCount += 1;
               const doneAfter = getBatchCompletedCount(state, totalCount);
               setStatus(
-                "Batch " + indexLabel + " | " + doneAfter + "/" + totalCount +
-                " completed: Error: " + (error?.message || String(error)),
+                "Chat " + indexLabel + ": could not be saved. " + (error?.message || String(error)),
                 "error"
               );
             }
@@ -1047,8 +1467,7 @@
             failure: failureEntry
           });
           setStatus(
-            "Batch " + indexLabel + " | " + doneAfter + "/" + totalCount +
-            " completed: Internal error, continuing with next thread: " + errorMessage,
+            "Chat " + indexLabel + ": something went wrong. Moving to the next chat. " + errorMessage,
             "error"
           );
 
@@ -1069,25 +1488,37 @@
         state.updatedAt = Date.now();
         saveBatchState(state);
         const pausedByHiddenTab = context.pauseReason === "hidden_tab_timeout";
+        const pausedByContextChange = context.pauseReason === "context_changed";
         const pauseMessage = pausedByHiddenTab
           ? (
-            "Batch paused at " + state.nextIndex + "/" + totalCount +
-            ": ChatGPT tab stayed in the background too long. Make the tab visible and continue with 'Resume Batch'."
+            "Paused at " + state.nextIndex + "/" + totalCount +
+            ". Keep this ChatGPT tab visible, then click 'Continue Saving'."
           )
-          : (
-            "Batch paused at " + state.nextIndex + "/" + totalCount + ". Continue with 'Resume Batch'."
-          );
+          : pausedByContextChange
+            ? (
+              "Paused at " + state.nextIndex + "/" + totalCount +
+              ". The open chat changed during saving. Return to this ChatGPT tab, then click 'Continue Saving'."
+            )
+            : (
+            "Paused at " + state.nextIndex + "/" + totalCount + ". Click 'Continue Saving' when you are ready."
+            );
         appendBatchDebugEvent(context, {
           level: "warn",
           code: "batch_paused",
           message: pausedByHiddenTab
-            ? "Batch paused (tab too long in background)."
-            : "Batch paused (stop requested).",
+            ? "Multi-chat save paused because the tab was hidden too long."
+            : pausedByContextChange
+              ? "Multi-chat save paused because the open chat changed during saving."
+              : "Multi-chat save paused after a stop request.",
           position: Math.max(0, Number(state.nextIndex) || 0)
         });
         await maybeFlushBatchDebugLog(context, {
           force: true,
-          trigger: pausedByHiddenTab ? "batch_paused_hidden_tab" : "batch_paused"
+          trigger: pausedByHiddenTab
+            ? "batch_paused_hidden_tab"
+            : pausedByContextChange
+              ? "batch_paused_context_changed"
+              : "batch_paused"
         });
         setStatus(
           pauseMessage,
@@ -1102,11 +1533,11 @@
       saveBatchState(state);
 
       let finalMessage =
-        "Batch finished: " +
+        "Finished saving many chats: " +
         state.successCount +
         " saved, " +
         state.failureCount +
-        " errors, " +
+        " issues, " +
         state.skippedCount +
         " skipped.";
       let failureReportFileName = "";
@@ -1128,7 +1559,7 @@
       appendBatchDebugEvent(context, {
         level: state.failureCount > 0 ? "warn" : "info",
         code: "batch_completed",
-        message: "Batch completed.",
+        message: "Multi-chat save completed.",
         position: totalCount,
         extra: {
           successCount: state.successCount,
@@ -1143,7 +1574,7 @@
       });
 
       if (failureReportFileName) {
-        finalMessage += " Failure report: " + failureReportFileName + ".";
+        finalMessage += " Help report: " + failureReportFileName + ".";
       }
 
       setStatus(finalMessage, state.failureCount > 0 ? "error" : "success", 16000);
@@ -1157,7 +1588,7 @@
         appendBatchDebugEvent(context, {
           level: "warn",
           code: "batch_paused",
-          message: "Batch paused (cancel exception).",
+          message: "Multi-chat save paused after stop request.",
           position: Math.max(0, Number(state.nextIndex) || 0)
         });
         await maybeFlushBatchDebugLog(context, {
@@ -1165,7 +1596,7 @@
           trigger: "batch_paused_cancel_error"
         });
         setStatus(
-          "Batch paused at " + state.nextIndex + "/" + totalCount + ". Continue with 'Resume Batch'.",
+          "Paused at " + state.nextIndex + "/" + totalCount + ". Click 'Continue Saving' to keep going.",
           "success",
           10000
         );
@@ -1178,7 +1609,7 @@
       appendBatchDebugEvent(context, {
         level: "error",
         code: "batch_crashed",
-        message: "Batch export crashed.",
+        message: "Multi-chat save crashed.",
         position: Math.max(0, Number(state.nextIndex) || 0),
         extra: {
           error: error?.message || String(error)
@@ -1188,7 +1619,7 @@
         force: true,
         trigger: "batch_crashed"
       });
-      setStatus("Batch export error: " + (error?.message || String(error)), "error", 12000);
+      setStatus("Could not save many chats: " + (error?.message || String(error)), "error", 12000);
     } finally {
       context.running = false;
       if (batchRunContext === context) {
@@ -1210,15 +1641,18 @@
       const payload = await fetchConversationPayload(meta.id, setStatus, {
         timeoutMs: BATCH_ITEM_TIMEOUT_MS,
         maxRetries: BATCH_ITEM_MAX_RETRIES,
-        contextLabel: "Batch " + indexLabel + " | " + progressLabel
+        contextLabel: "Chats " + indexLabel + " | " + progressLabel
       });
 
       const messages = extractMessagesFromApiPayload(payload);
+      if (shouldUseDomFallbackForApiPayload(payload)) {
+        throw new Error("API payload did not include the rendered rich media.");
+      }
       if (!Array.isArray(messages) || messages.length === 0) {
         throw new Error("No messages in thread.");
       }
 
-      return await createAndDownloadBatchHtml({
+      return await createAndDownloadBatchArtifact({
         meta,
         title: sanitizeConversationTitle(payload?.title || meta?.title || "chatgpt_dialog"),
         source: "api",
@@ -1246,6 +1680,48 @@
     }
   }
 
+  function createExpectedConversationRouteGuard(conversationId) {
+    const targetId = String(conversationId || "").trim();
+    const pageUrl = buildConversationPageUrl(targetId);
+    let pathname = "";
+    try {
+      pathname = new URL(pageUrl, window.location.origin).pathname || "";
+    } catch (_error) {
+      pathname = String(window.location.pathname || "");
+    }
+
+    return {
+      conversationId: targetId,
+      pathname,
+      pageUrl,
+      title: getConversationTitleFromPage()
+    };
+  }
+
+  async function collectMessagesForBatchDomFallback(meta, context) {
+    const conversationId = String(meta?.id || "").trim();
+    if (!conversationId) {
+      return null;
+    }
+
+    const routeGuard = createExpectedConversationRouteGuard(conversationId);
+    const batchOptions = context?.state?.options || {};
+    const exportFormat = normalizeSingleExportFormat(batchOptions?.format);
+    const formatLabel = getSingleExportFormatLabel(exportFormat);
+
+    const result = await collectMessagesWithIntegrityRetry(setStatus, {
+      allowExtendedWait: true,
+      isCancelled: () => Boolean(context?.cancelRequested || exportCancelRequested),
+      routeGuard,
+      formatLabel
+    });
+    assertSingleExportRouteGuard(routeGuard);
+    if (!Array.isArray(result?.messages) || result.messages.length === 0) {
+      return null;
+    }
+    return result;
+  }
+
   async function tryExportConversationViaDomFallback(meta, position, totalCount, context) {
     const currentConversationId = getConversationIdFromPath() || "";
     if (!currentConversationId || currentConversationId !== String(meta?.id || "")) {
@@ -1254,25 +1730,31 @@
 
     const doneBefore = getBatchCompletedCount(context?.state, totalCount);
     setStatus(
-      "Batch " + position + "/" + totalCount + " | " + doneBefore + "/" + totalCount +
-      " completed: API is slow, using DOM fallback...",
+      "Chat " + position + "/" + totalCount + ": loading this chat directly in the page...",
       "busy"
     );
 
-    const messages = await collectMessagesFromDom(setStatus, {
-      allowExtendedWait: true,
-      isCancelled: () => Boolean(context?.cancelRequested)
-    });
-
-    if (!Array.isArray(messages) || messages.length === 0) {
+    let exportResult = null;
+    try {
+      exportResult = await collectMessagesForBatchDomFallback(meta, context);
+    } catch (error) {
+      if (isExportContextChangedError(error)) {
+        return null;
+      }
+      throw error;
+    }
+    if (!Array.isArray(exportResult?.messages) || exportResult.messages.length === 0) {
       return null;
     }
+    const finalTitle = sanitizeConversationTitle(
+      exportResult?.conversationTitle || getConversationTitleFromPage() || meta?.title || "chatgpt_dialog"
+    );
 
-    return await createAndDownloadBatchHtml({
+    return await createAndDownloadBatchArtifact({
       meta,
-      title: sanitizeConversationTitle(getConversationTitleFromPage() || meta?.title || "chatgpt_dialog"),
-      source: "dom",
-      messages,
+      title: finalTitle,
+      source: exportResult?.source || "dom",
+      messages: exportResult.messages,
       position,
       totalCount,
       options: context?.state?.options || {},
@@ -1288,33 +1770,47 @@
 
     const doneBefore = getBatchCompletedCount(context?.state, totalCount);
     setStatus(
-      "Batch " + position + "/" + totalCount + " | " + doneBefore + "/" + totalCount +
-      " completed: opening thread for DOM export...",
+      "Chat " + position + "/" + totalCount + ": opening this chat to finish saving...",
       "busy"
     );
 
+    const waitForVisibility = async () => {
+      const visibleReady = await waitForBatchVisibility({
+        maxWaitMs: BATCH_HIDDEN_WAIT_MAX_MS,
+        isCancelled: () => Boolean(context?.cancelRequested || exportCancelRequested),
+        progressCallback: setStatus,
+        indexLabel: position + "/" + totalCount,
+        completedLabel: getBatchCompletedCount(context?.state, totalCount) + "/" + totalCount
+      });
+      if (!visibleReady) {
+        throw createSingleExportHiddenTimeoutError();
+      }
+      return true;
+    };
+
     const opened = await openConversationForBatchFallback(conversationId, setStatus, {
       timeoutMs: Math.max(28000, Math.floor(BATCH_ITEM_TIMEOUT_MS * 0.28)),
-      isCancelled: () => Boolean(context?.cancelRequested)
+      isCancelled: () => Boolean(context?.cancelRequested || exportCancelRequested),
+      waitForVisibility
     });
     if (!opened) {
       return null;
     }
 
     await waitForCapturedConversationData(conversationId, 1600);
-    const messages = await collectMessagesFromDom(setStatus, {
-      allowExtendedWait: true,
-      isCancelled: () => Boolean(context?.cancelRequested)
-    });
-    if (!Array.isArray(messages) || messages.length === 0) {
+    const exportResult = await collectMessagesForBatchDomFallback(meta, context);
+    if (!Array.isArray(exportResult?.messages) || exportResult.messages.length === 0) {
       return null;
     }
+    const finalTitle = sanitizeConversationTitle(
+      exportResult?.conversationTitle || getConversationTitleFromPage() || meta?.title || "chatgpt_dialog"
+    );
 
-    return await createAndDownloadBatchHtml({
+    return await createAndDownloadBatchArtifact({
       meta,
-      title: sanitizeConversationTitle(getConversationTitleFromPage() || meta?.title || "chatgpt_dialog"),
+      title: finalTitle,
       source: "dom-nav",
-      messages,
+      messages: exportResult.messages,
       position,
       totalCount,
       options: context?.state?.options || {},
@@ -1334,11 +1830,15 @@
 
     const timeoutMs = Math.max(5000, Number(options?.timeoutMs) || 35000);
     const isCancelled = typeof options?.isCancelled === "function" ? options.isCancelled : () => false;
+    const waitForVisibility = typeof options?.waitForVisibility === "function" ? options.waitForVisibility : null;
     const startedAt = Date.now();
     let attempt = 0;
     let lastPath = String(window.location.pathname || "");
 
     while ((Date.now() - startedAt) < timeoutMs) {
+      if (waitForVisibility) {
+        await waitForVisibility();
+      }
       if (isCancelled()) {
         throw createExportCancelledError();
       }
@@ -1350,7 +1850,12 @@
         clickSyntheticConversationLink(targetId);
       }
 
-      const routeReached = await waitForConversationRouteReady(targetId, Math.min(9000, timeoutMs), isCancelled);
+      const routeReached = await waitForConversationRouteReady(
+        targetId,
+        Math.min(9000, timeoutMs),
+        isCancelled,
+        waitForVisibility
+      );
       if (routeReached) {
         return true;
       }
@@ -1362,7 +1867,7 @@
       }
 
       if (typeof progressCallback === "function") {
-        progressCallback("Batch: thread route is not active yet, retrying navigation...", "busy");
+        progressCallback("Opening the chat, trying again...", "busy");
       }
       await sleep(220 + Math.floor(Math.random() * 180));
     }
@@ -1425,12 +1930,15 @@
     }
   }
 
-  async function waitForConversationRouteReady(conversationId, timeoutMs, isCancelled) {
+  async function waitForConversationRouteReady(conversationId, timeoutMs, isCancelled, waitForVisibility) {
     const targetId = String(conversationId || "").trim();
     const endAt = Date.now() + Math.max(1000, Number(timeoutMs) || 0);
     let matchedAt = 0;
 
     while (Date.now() < endAt) {
+      if (typeof waitForVisibility === "function") {
+        await waitForVisibility();
+      }
       if (typeof isCancelled === "function" && isCancelled()) {
         throw createExportCancelledError();
       }
@@ -1458,7 +1966,7 @@
     return false;
   }
 
-  async function createAndDownloadBatchHtml({
+  async function createAndDownloadBatchArtifact({
     meta,
     title,
     source,
@@ -1469,27 +1977,30 @@
     usedFileNames
   }) {
     const exportedAt = new Date();
-    const exportMessages = await prepareMessagesForHtmlExport(messages, {
-      position,
-      totalCount
-    });
-    assertExportableConversationMessages(exportMessages);
-    const threadStartedAt = resolveConversationStartedAt(exportMessages, [
+    assertExportableConversationMessages(messages);
+    const threadStartedAt = resolveConversationStartedAt(messages, [
       meta?.create_time,
       meta?.createTime,
       meta?.update_time,
       meta?.updateTime
     ]);
-    const html = buildHtmlDocument({
+    const exportFormat = normalizeSingleExportFormat(options?.format);
+    const artifact = await buildSingleExportArtifact({
+      format: exportFormat,
+      detailedMetadata: normalizeDetailedMetadataOption(options?.detailedMetadata, exportFormat),
       title,
       source,
-      messages: exportMessages,
+      messages,
       exportedAt,
       threadStartedAt,
-      pageUrl: buildConversationPageUrl(meta?.id || "")
+      pageUrl: buildConversationPageUrl(meta?.id || ""),
+      htmlContext: {
+        position,
+        totalCount
+      }
     });
 
-    const rawFileName = buildBatchFileName(title, threadStartedAt, position, totalCount);
+    const rawFileName = buildBatchFileName(title, threadStartedAt, position, totalCount, exportFormat);
     const fileName = uniquifyFileName(rawFileName, usedFileNames);
     const folderPath = buildBatchFolderPath({
       accountName: options?.accountName || "",
@@ -1497,8 +2008,11 @@
       date: threadStartedAt
     });
 
-    await triggerBrowserDownload(html, fileName, { subdirectory: folderPath });
-    return { fileName, source };
+    await triggerBrowserDownload(artifact.content, fileName, {
+      mimeType: artifact.mimeType,
+      subdirectory: folderPath
+    });
+    return { fileName, source, format: exportFormat };
   }
 
   async function createAndDownloadBatchFailureReport({
@@ -1520,7 +2034,7 @@
       exportedAt
     });
     const reportFileName = uniquifyFileName(
-      "Batch_Failure_Report_" + formatDateForFileName(exportedAt) + ".html",
+      "Chat_Save_Help_Report_" + formatDateForFileName(exportedAt) + ".html",
       usedFileNames instanceof Set ? usedFileNames : new Set()
     );
     const folderPath = buildBatchFolderPath({
@@ -1630,7 +2144,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Batch Failure Report</title>
+  <title>Chat Save Help Report</title>
   <style>
     :root { color-scheme: light; }
     body {
@@ -1702,18 +2216,18 @@
 <body>
   <main class="card">
     <section class="head">
-      <h1>Batch Failure Report</h1>
-      <p><strong>Exported:</strong> <time datetime="${escapeHtml(exportedIso)}">${escapeHtml(exportedLabel)}</time></p>
-      <p><strong>Total:</strong> ${total} | <strong>Saved:</strong> ${success} | <strong>Errors:</strong> ${failure} | <strong>Skipped:</strong> ${skipped}</p>
-      <p><strong>Entries in report:</strong> ${normalizedFailures.length}</p>
+      <h1>Chat Save Help Report</h1>
+      <p><strong>Created:</strong> <time datetime="${escapeHtml(exportedIso)}">${escapeHtml(exportedLabel)}</time></p>
+      <p><strong>Total chats:</strong> ${total} | <strong>Saved:</strong> ${success} | <strong>Issues:</strong> ${failure} | <strong>Skipped:</strong> ${skipped}</p>
+      <p><strong>Chats listed here:</strong> ${normalizedFailures.length}</p>
     </section>
     <section>
-      <h2>Errors by reason</h2>
+      <h2>Issues by reason</h2>
       <div class="table-wrap">
         <table class="reason-table">
           <thead>
             <tr>
-              <th>Reason Code</th>
+              <th>Issue Code</th>
               <th>Count</th>
             </tr>
           </thead>
@@ -1731,11 +2245,11 @@ ${reasonRows}
             <th>#</th>
             <th>Position</th>
             <th>Type</th>
-            <th>Reason Code</th>
-            <th>Reason</th>
-            <th>Conversation ID</th>
+            <th>Issue Code</th>
+            <th>What happened</th>
+            <th>Chat ID</th>
             <th>Title</th>
-            <th>Error</th>
+            <th>Details</th>
           </tr>
         </thead>
         <tbody>
@@ -2039,7 +2553,7 @@ ${diagnosticRows}
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Batch Debug Log (Live)</title>
+  <title>Chat Save Help File</title>
   <style>
     body {
       margin: 0;
@@ -2102,24 +2616,24 @@ ${diagnosticRows}
 <body>
   <main class="card">
     <section class="head">
-      <h1>Batch Debug Log (Live checkpoint)</h1>
-      <p><strong>Checkpoint:</strong> <time datetime="${escapeHtml(exportedIso)}">${escapeHtml(exportedLabel)}</time></p>
-      <p><strong>Trigger:</strong> ${escapeHtml(trigger || "auto")}</p>
-      <p><strong>Status:</strong> ${escapeHtml(status)} | <strong>Progress:</strong> ${nextIndex}/${total} | <strong>Saved:</strong> ${success} | <strong>Errors:</strong> ${failure} | <strong>Skipped:</strong> ${skipped}</p>
-      <p><strong>Events (in memory):</strong> ${(Array.isArray(events) ? events.length : 0)} | <strong>Error entries:</strong> ${(Array.isArray(state?.failures) ? state.failures.length : 0)}</p>
+      <h1>Chat Save Help File</h1>
+      <p><strong>Created:</strong> <time datetime="${escapeHtml(exportedIso)}">${escapeHtml(exportedLabel)}</time></p>
+      <p><strong>Update reason:</strong> ${escapeHtml(trigger || "auto")}</p>
+      <p><strong>Status:</strong> ${escapeHtml(status)} | <strong>Progress:</strong> ${nextIndex}/${total} | <strong>Saved:</strong> ${success} | <strong>Issues:</strong> ${failure} | <strong>Skipped:</strong> ${skipped}</p>
+      <p><strong>Saved events:</strong> ${(Array.isArray(events) ? events.length : 0)} | <strong>Chats with issues:</strong> ${(Array.isArray(state?.failures) ? state.failures.length : 0)}</p>
     </section>
     <section class="table-wrap">
-      <h2>Error list</h2>
+      <h2>Chats with issues</h2>
       <table>
         <thead>
           <tr>
             <th>#</th>
             <th>Position</th>
-            <th>Reason Code</th>
-            <th>Reason</th>
-            <th>Conversation ID</th>
+            <th>Issue Code</th>
+            <th>What happened</th>
+            <th>Chat ID</th>
             <th>Title</th>
-            <th>Error</th>
+            <th>Details</th>
           </tr>
         </thead>
         <tbody>
@@ -2156,7 +2670,7 @@ ${eventRows}
 
   function buildBatchDebugLogFileName(date) {
     const ts = date instanceof Date ? date : new Date();
-    return "Batch_Debug_Live_" + formatDateForFileName(ts) + ".html";
+    return "Chat_Save_Help_Live_" + formatDateForFileName(ts) + ".html";
   }
 
   async function prepareMessagesForHtmlExport(messages, context = {}) {
@@ -2192,7 +2706,7 @@ ${eventRows}
         const pos = Number(context?.position) || 0;
         const total = Number(context?.totalCount) || 0;
         const prefix = (pos > 0 && total > 0)
-          ? ("Batch " + pos + "/" + total + " | ")
+          ? ("Chat " + pos + "/" + total + ": ")
           : "";
         setStatus(
           prefix + "Embedding images " + (index + 1) + "/" + targetImageSources.length + "...",
@@ -2464,12 +2978,18 @@ ${eventRows}
   }
 
   function requestExportCancel() {
+    if (singleExportPendingResume) {
+      clearSingleExportPendingResume();
+      setStatus("Trying to resume was cancelled.", "success", 5000);
+      return true;
+    }
+
     if (isExporting) {
       exportCancelRequested = true;
       if (batchRunContext && batchRunContext.running) {
         batchRunContext.cancelRequested = true;
       }
-      setStatus("Stop requested. Current step will finish...", "busy", 9000);
+      setStatus("Stop requested. The current step will finish first...", "busy", 9000);
       return true;
     }
 
@@ -2478,7 +2998,7 @@ ${eventRows}
       savedState.status = "paused";
       savedState.updatedAt = Date.now();
       saveBatchState(savedState);
-      setStatus("Batch paused.", "success", 5000);
+      setStatus("Multi-chat save paused.", "success", 5000);
       return true;
     }
 
@@ -2493,6 +3013,107 @@ ${eventRows}
 
   function isExportCancelledError(error) {
     return error?.code === "export_cancelled";
+  }
+
+  function throwIfExportCancelled(isCancelled) {
+    const cancelled = typeof isCancelled === "function"
+      ? isCancelled()
+      : Boolean(isCancelled);
+    if (cancelled) {
+      throw createExportCancelledError();
+    }
+  }
+
+  function createSingleExportHiddenTimeoutError() {
+    const error = new Error(
+      "The save stopped because this ChatGPT tab was hidden too long. Keep it visible and try again."
+    );
+    error.code = "single_hidden_timeout";
+    return error;
+  }
+
+  function isSingleExportHiddenTimeoutError(error) {
+    return error?.code === "single_hidden_timeout";
+  }
+
+  function createSingleExportReloadRequiredError() {
+    const error = new Error("This chat needs one reload so message times can be captured.");
+    error.code = "single_reload_required";
+    return error;
+  }
+
+  function isSingleExportReloadRequiredError(error) {
+    return error?.code === "single_reload_required";
+  }
+
+  function createExportIntegrityError(message, code = "export_integrity") {
+    const error = new Error(String(message || "The chat could not be saved safely."));
+    error.code = String(code || "export_integrity");
+    return error;
+  }
+
+  function isExportIntegrityError(error) {
+    return Boolean(error?.code) && String(error.code).startsWith("export_integrity");
+  }
+
+  function createSingleExportRouteGuard() {
+    return {
+      conversationId: String(getConversationIdFromPath() || "").trim(),
+      pathname: String(window.location.pathname || ""),
+      pageUrl: String(window.location.href || ""),
+      title: getConversationTitleFromPage()
+    };
+  }
+
+  function cloneSingleExportRouteGuard(routeGuard) {
+    if (!routeGuard || typeof routeGuard !== "object") {
+      return createSingleExportRouteGuard();
+    }
+
+    return {
+      conversationId: String(routeGuard.conversationId || "").trim(),
+      pathname: String(routeGuard.pathname || ""),
+      pageUrl: String(routeGuard.pageUrl || ""),
+      title: String(routeGuard.title || "")
+    };
+  }
+
+  function createExportContextChangedError(routeGuard) {
+    const error = new Error("Chat changed during save.");
+    error.code = "export_context_changed";
+    error.expectedConversationId = String(routeGuard?.conversationId || "").trim();
+    error.expectedPathname = String(routeGuard?.pathname || "");
+    error.expectedPageUrl = String(routeGuard?.pageUrl || "");
+    error.currentConversationId = String(getConversationIdFromPath() || "").trim();
+    error.currentPathname = String(window.location.pathname || "");
+    error.currentPageUrl = String(window.location.href || "");
+    return error;
+  }
+
+  function isExportContextChangedError(error) {
+    return error?.code === "export_context_changed";
+  }
+
+  function assertSingleExportRouteGuard(routeGuard) {
+    if (!routeGuard || typeof routeGuard !== "object") {
+      return;
+    }
+
+    const expectedConversationId = String(routeGuard.conversationId || "").trim();
+    const expectedPathname = String(routeGuard.pathname || "");
+    const currentConversationId = String(getConversationIdFromPath() || "").trim();
+    const currentPathname = String(window.location.pathname || "");
+
+    if (expectedConversationId) {
+      if (currentConversationId !== expectedConversationId) {
+        throw createExportContextChangedError(routeGuard);
+      }
+      return;
+    }
+
+    if (currentPathname !== expectedPathname) {
+      throw createExportContextChangedError(routeGuard);
+    }
   }
 
   function isConversationPage() {
@@ -2510,40 +3131,135 @@ ${eventRows}
   }
 
   async function collectMessages(progressCallback, options = {}) {
+    const routeGuard = options?.routeGuard || null;
+    assertSingleExportRouteGuard(routeGuard);
     const conversationId = getConversationIdFromPath() || "";
+    const observedTimestampFallbackMap = options?.observedTimestampFallbackMap instanceof Map
+      ? options.observedTimestampFallbackMap
+      : getObservedTimestampFallbackMap(conversationId);
     await waitForCapturedConversationData(conversationId, 1400);
+    assertSingleExportRouteGuard(routeGuard);
     ensureConversationBaselineMessageIds(conversationId);
 
-    progressCallback("Collecting messages from DOM...", "busy");
+    progressCallback("Reading messages from the page...", "busy");
     let domMessages = await collectMessagesFromDom(progressCallback, {
       allowExtendedWait: options?.allowExtendedWait !== false,
-      isCancelled: typeof options?.isCancelled === "function" ? options.isCancelled : null
+      isCancelled: typeof options?.isCancelled === "function" ? options.isCancelled : null,
+      routeGuard,
+      observedTimestampFallbackMap
     });
+    assertSingleExportRouteGuard(routeGuard);
 
     if (conversationId && hasMessagesWithUnknownTimestamps(domMessages)) {
-      await tryRefreshCapturedConversationDataFromApi(conversationId, progressCallback);
-      const refreshedTimestampMap = getCapturedTimestampMap(conversationId);
+      assertSingleExportRouteGuard(routeGuard);
+      const refreshedCapture = await tryRefreshCapturedConversationDataFromApi(conversationId, progressCallback);
+      assertSingleExportRouteGuard(routeGuard);
+      const refreshedTimestampMap = refreshedCapture?.timestampMap instanceof Map
+        ? refreshedCapture.timestampMap
+        : getCapturedTimestampMap(conversationId);
       if (refreshedTimestampMap && refreshedTimestampMap.size > 0) {
         domMessages = applyCapturedTimestampsToMessages(domMessages, refreshedTimestampMap);
       }
+      if (hasMessagesWithUnknownTimestamps(domMessages) && Array.isArray(refreshedCapture?.messages)) {
+        domMessages = applyApiMessageTimestampsToMessages(domMessages, refreshedCapture.messages);
+      }
+    }
+
+    if (
+      conversationId &&
+      Boolean(options?.allowTimestampBootstrapReload) &&
+      shouldAttemptSingleExportTimestampReload(conversationId, domMessages)
+    ) {
+      throw createSingleExportReloadRequiredError();
     }
 
     return {
       source: "dom",
       conversationTitle: getCapturedConversationTitle(conversationId) || getConversationTitleFromPage(),
-      messages: domMessages
+      messages: domMessages,
+      stabilitySignature: buildMessageCollectionStabilitySignature(domMessages)
     };
+  }
+
+  async function collectMessagesWithIntegrityRetry(progressCallback, options = {}) {
+    const maxAttempts = Math.max(1, Number(options?.maxAttempts) || SINGLE_EXPORT_COLLECTION_MAX_ATTEMPTS);
+    const isCancelled = typeof options?.isCancelled === "function" ? options.isCancelled : () => false;
+    const routeGuard = options?.routeGuard || null;
+    const conversationId = String(routeGuard?.conversationId || getConversationIdFromPath() || "").trim();
+    const formatLabel = String(options?.formatLabel || "export").trim() || "export";
+    let lastIntegrityError = null;
+    const persistedObservedTimestampFallbackMap = cloneTimestampInfoMap(
+      getObservedTimestampFallbackMap(conversationId)
+    );
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      if (isCancelled()) {
+        throw createExportCancelledError();
+      }
+      assertSingleExportRouteGuard(routeGuard);
+
+      if (attempt > 1 && typeof progressCallback === "function") {
+        progressCallback(
+          "Checking the chat again before saving the " + formatLabel + " file (" + attempt + "/" + maxAttempts + ")...",
+          "busy"
+        );
+      }
+
+      try {
+        const attemptObservedTimestampFallbackMap = cloneTimestampInfoMap(
+          persistedObservedTimestampFallbackMap
+        );
+        const result = await collectMessages(progressCallback, {
+          ...options,
+          observedTimestampFallbackMap: attemptObservedTimestampFallbackMap
+        });
+        await ensureSingleExportThreadStable(progressCallback, {
+          routeGuard,
+          isCancelled,
+          expectedSignature: result?.stabilitySignature || ""
+        });
+        replaceObservedTimestampFallbackMap(conversationId, attemptObservedTimestampFallbackMap);
+        return result;
+      } catch (error) {
+        if (
+          isExportCancelledError(error) ||
+          isSingleExportHiddenTimeoutError(error) ||
+          isExportContextChangedError(error)
+        ) {
+          throw error;
+        }
+
+        if (!isExportIntegrityError(error)) {
+          throw error;
+        }
+
+        lastIntegrityError = error;
+        if (attempt >= maxAttempts) {
+          throw error;
+        }
+
+        if (typeof progressCallback === "function") {
+          progressCallback(
+            "The chat is still changing. Waiting a moment and checking again...",
+            "busy"
+          );
+        }
+        await sleep(SINGLE_EXPORT_RETRY_DELAY_MS);
+      }
+    }
+
+    throw lastIntegrityError || createExportIntegrityError("The chat could not be saved safely.");
   }
 
   async function tryRefreshCapturedConversationDataFromApi(conversationId, progressCallback) {
     const targetConversationId = String(conversationId || "").trim();
     if (!targetConversationId) {
-      return false;
+      return null;
     }
 
     try {
       if (typeof progressCallback === "function") {
-        progressCallback("Syncing fresh timestamps...", "busy");
+        progressCallback("Checking message times...", "busy");
       }
       const payload = await fetchConversationPayload(targetConversationId, progressCallback, {
         timeoutMs: 25000,
@@ -2551,15 +3267,20 @@ ${eventRows}
         contextLabel: "Timestamp sync"
       });
       const timestampMap = extractTimestampMapFromApiPayload(payload);
+      const messages = extractMessagesFromApiPayload(payload);
       const title = sanitizeConversationTitle(payload?.title || "");
-      if (timestampMap.size === 0 && !title) {
-        return false;
+      if (timestampMap.size === 0 && !title && messages.length === 0) {
+        return null;
       }
       rememberCapturedConversationData(targetConversationId, timestampMap, title);
-      return timestampMap.size > 0;
+      return {
+        timestampMap,
+        messages,
+        title
+      };
     } catch (error) {
       console.warn("[ChatGPT Export] Timestamp sync skipped:", error);
-      return false;
+      return null;
     }
   }
 
@@ -2618,6 +3339,174 @@ ${eventRows}
     });
   }
 
+  function applyApiMessageTimestampsToMessages(messages, apiMessages) {
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return [];
+    }
+    if (!Array.isArray(apiMessages) || apiMessages.length === 0) {
+      return messages;
+    }
+
+    const candidates = apiMessages
+      .map((message, index) => buildApiTimestampMatchCandidate(message, index))
+      .filter(Boolean);
+    if (candidates.length === 0) {
+      return messages;
+    }
+
+    const usedCandidateIndexes = new Set();
+    let searchStart = 0;
+    let changed = false;
+
+    const nextMessages = messages.map((message) => {
+      const candidateIndex = findMatchingApiTimestampCandidateIndex(
+        message,
+        candidates,
+        usedCandidateIndexes,
+        searchStart
+      );
+      if (candidateIndex < 0) {
+        return message;
+      }
+
+      usedCandidateIndexes.add(candidateIndex);
+      searchStart = Math.max(searchStart, candidateIndex + 1);
+
+      if (messageHasKnownTimestamp(message)) {
+        return message;
+      }
+
+      const candidate = candidates[candidateIndex];
+      if (!candidate?.timestampIso && !candidate?.timestampDisplay) {
+        return message;
+      }
+
+      changed = true;
+      return {
+        ...message,
+        timestampIso: candidate.timestampIso || "",
+        timestampDisplay: candidate.timestampDisplay || "Unknown time"
+      };
+    });
+
+    return changed ? nextMessages : messages;
+  }
+
+  function buildApiTimestampMatchCandidate(message, index) {
+    if (!messageHasKnownTimestamp(message)) {
+      return null;
+    }
+
+    return {
+      index,
+      role: normalizeRole(message?.role || message?.author?.role || ""),
+      textKey: buildTimestampMatchText(message),
+      timestampIso: String(message?.timestampIso || "").trim(),
+      timestampDisplay: String(message?.timestampDisplay || "").trim() || "Unknown time"
+    };
+  }
+
+  function buildTimestampMatchText(message) {
+    return normalizeTimestampMatchText(buildMessageExportText(message));
+  }
+
+  function normalizeTimestampMatchText(value) {
+    return normalizeExportTextContent(value || "")
+      .replace(/\u00a0/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function findMatchingApiTimestampCandidateIndex(message, candidates, usedCandidateIndexes, searchStart = 0) {
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      return -1;
+    }
+
+    const role = normalizeRole(message?.role || "");
+    const textKey = buildTimestampMatchText(message);
+
+    const exactMatch = findApiTimestampCandidateIndex(
+      role,
+      textKey,
+      candidates,
+      usedCandidateIndexes,
+      searchStart,
+      false
+    );
+    if (exactMatch >= 0) {
+      return exactMatch;
+    }
+
+    return findApiTimestampCandidateIndex(
+      role,
+      textKey,
+      candidates,
+      usedCandidateIndexes,
+      searchStart,
+      true
+    );
+  }
+
+  function findApiTimestampCandidateIndex(role, textKey, candidates, usedCandidateIndexes, searchStart, allowLooseTextMatch) {
+    for (let index = searchStart; index < candidates.length; index += 1) {
+      if (usedCandidateIndexes.has(index)) {
+        continue;
+      }
+
+      const candidate = candidates[index];
+      if (!candidate || candidate.role !== role) {
+        continue;
+      }
+
+      if (timestampMatchTextEquals(textKey, candidate.textKey, allowLooseTextMatch)) {
+        return index;
+      }
+    }
+
+    return -1;
+  }
+
+  function timestampMatchTextEquals(left, right, allowLooseTextMatch = false) {
+    const a = String(left || "").trim();
+    const b = String(right || "").trim();
+    if (!a || !b) {
+      return false;
+    }
+    if (a === b) {
+      return true;
+    }
+    if (!allowLooseTextMatch) {
+      return false;
+    }
+
+    const minLength = 48;
+    return (
+      (a.length >= minLength && a.startsWith(b)) ||
+      (b.length >= minLength && b.startsWith(a))
+    );
+  }
+
+  function shouldAttemptSingleExportTimestampReload(conversationId, messages) {
+    const id = String(conversationId || "").trim();
+    if (!id || !Array.isArray(messages) || messages.length === 0) {
+      return false;
+    }
+
+    const capturedMap = getCapturedTimestampMap(id);
+    if (capturedMap instanceof Map && capturedMap.size > 0) {
+      return false;
+    }
+
+    let knownTimestampCount = 0;
+    for (let index = 0; index < messages.length; index += 1) {
+      if (messageHasKnownTimestamp(messages[index])) {
+        knownTimestampCount += 1;
+      }
+    }
+
+    return knownTimestampCount === 0;
+  }
+
   async function waitForCapturedConversationData(conversationId, timeoutMs) {
     if (!conversationId) {
       return false;
@@ -2654,6 +3543,9 @@ ${eventRows}
     const debugLogEnabled = typeof rawOptions?.debugLogEnabled === "boolean"
       ? rawOptions.debugLogEnabled
       : batchDebugLogEnabled;
+    const format = normalizeSingleExportFormat(rawOptions?.format);
+    const detailedMetadata = normalizeDetailedMetadataOption(rawOptions?.detailedMetadata, format);
+    const startFresh = Boolean(rawOptions?.startFresh);
 
     const providedAccountName = sanitizeConversationTitle(rawOptions?.accountName || "");
     const accountName = providedAccountName || resolveAccountNameForBatch();
@@ -2661,7 +3553,10 @@ ${eventRows}
     return {
       yearOnlyFolder,
       accountName,
-      debugLogEnabled
+      debugLogEnabled,
+      format,
+      detailedMetadata,
+      startFresh
     };
   }
 
@@ -2694,6 +3589,8 @@ ${eventRows}
         yearOnlyFolder: Boolean(options?.yearOnlyFolder),
         accountName: sanitizeConversationTitle(options?.accountName || ""),
         debugLogEnabled: Boolean(options?.debugLogEnabled),
+        format: normalizeSingleExportFormat(options?.format),
+        detailedMetadata: normalizeDetailedMetadataOption(options?.detailedMetadata, options?.format),
         debugLogFileName: buildBatchDebugLogFileName(new Date(now))
       },
       items: normalizedItems
@@ -2721,6 +3618,8 @@ ${eventRows}
         yearOnlyFolder: Boolean(rawState?.options?.yearOnlyFolder),
         accountName: sanitizeConversationTitle(rawState?.options?.accountName || ""),
         debugLogEnabled: Boolean(rawState?.options?.debugLogEnabled),
+        format: normalizeSingleExportFormat(rawState?.options?.format),
+        detailedMetadata: normalizeDetailedMetadataOption(rawState?.options?.detailedMetadata, rawState?.options?.format),
         debugLogFileName: sanitizeForFileName(rawState?.options?.debugLogFileName || "")
       },
       items: Array.isArray(rawState.items)
@@ -2851,18 +3750,301 @@ ${eventRows}
     }
   }
 
-  function setExportLifecycleActive(operation) {
+  function setExportLifecycleActive(operation, options = {}) {
     runtimeOperation = String(operation || "");
+    runtimeExportFormat = normalizeSingleExportFormat(options?.format || runtimeExportFormat);
+    runtimeDetailedMetadata = normalizeDetailedMetadataOption(options?.detailedMetadata, runtimeExportFormat);
     runtimeStartedAt = Date.now();
+    setSingleExportInteractionGuardActive(
+      runtimeOperation === "single",
+      "Saving this chat. Please wait and keep this tab visible."
+    );
     startRuntimeHeartbeat();
     persistRuntimeState(true);
   }
 
   function setExportLifecycleIdle() {
+    if (singleExportPendingResume) {
+      runtimeOperation = "single-resume";
+      runtimeExportFormat = normalizeSingleExportFormat(singleExportPendingResume.format);
+      runtimeDetailedMetadata = normalizeDetailedMetadataOption(singleExportPendingResume.detailedMetadata, runtimeExportFormat);
+      runtimeStartedAt = Number(singleExportPendingResume.requestedAt) || Date.now();
+      setSingleExportInteractionGuardActive(false);
+      startRuntimeHeartbeat();
+      persistRuntimeState(true);
+      return;
+    }
+
     runtimeOperation = "";
+    runtimeExportFormat = "html";
+    runtimeDetailedMetadata = false;
     runtimeStartedAt = 0;
+    setSingleExportInteractionGuardActive(false);
     stopRuntimeHeartbeat();
     persistRuntimeState(true);
+  }
+
+  function setSingleExportPendingResume(options = {}) {
+    const format = normalizeSingleExportFormat(options?.format);
+    const detailedMetadata = normalizeDetailedMetadataOption(options?.detailedMetadata, format);
+    const routeGuard = cloneSingleExportRouteGuard(options?.routeGuard);
+    const reloadAttempts = Math.max(0, Number(options?.reloadAttempts) || 0);
+    singleExportResumeGeneration += 1;
+    singleExportPendingResume = {
+      format,
+      detailedMetadata,
+      routeGuard,
+      requestedAt: Date.now(),
+      reloadForTimestamps: Boolean(options?.reloadForTimestamps),
+      reloadAttempts
+    };
+    runtimeOperation = "single-resume";
+    runtimeExportFormat = format;
+    runtimeDetailedMetadata = detailedMetadata;
+    runtimeStartedAt = Number(singleExportPendingResume.requestedAt) || Date.now();
+    setSingleExportInteractionGuardActive(false);
+    startRuntimeHeartbeat();
+    saveSingleExportPendingResumeToStorage();
+    persistRuntimeState(true);
+    scheduleSingleExportAutoResumeAttempt(SINGLE_EXPORT_AUTO_RESUME_DELAY_MS);
+  }
+
+  function clearSingleExportPendingResume() {
+    const hadPending = Boolean(singleExportPendingResume);
+    singleExportPendingResume = null;
+    clearPersistedSingleExportPendingResume();
+    if (hadPending) {
+      singleExportResumeGeneration += 1;
+    }
+    if (singleExportResumeTimer) {
+      clearTimeout(singleExportResumeTimer);
+      singleExportResumeTimer = null;
+    }
+
+    if (!hadPending) {
+      return;
+    }
+
+    if (runtimeOperation === "single-resume") {
+      runtimeOperation = "";
+      runtimeDetailedMetadata = false;
+      runtimeStartedAt = 0;
+      if (!isExporting && !(batchRunContext && batchRunContext.running)) {
+        stopRuntimeHeartbeat();
+      }
+    }
+    persistRuntimeState(true);
+  }
+
+  function saveSingleExportPendingResumeToStorage() {
+    if (!singleExportPendingResume) {
+      clearPersistedSingleExportPendingResume();
+      return;
+    }
+
+    try {
+      window.sessionStorage.setItem(
+        SINGLE_EXPORT_PENDING_RESUME_STORAGE_KEY,
+        JSON.stringify({
+          format: normalizeSingleExportFormat(singleExportPendingResume.format),
+          detailedMetadata: normalizeDetailedMetadataOption(
+            singleExportPendingResume.detailedMetadata,
+            singleExportPendingResume.format
+          ),
+          routeGuard: cloneSingleExportRouteGuard(singleExportPendingResume.routeGuard),
+          requestedAt: Number(singleExportPendingResume.requestedAt) || Date.now(),
+          reloadForTimestamps: Boolean(singleExportPendingResume.reloadForTimestamps),
+          reloadAttempts: Math.max(0, Number(singleExportPendingResume.reloadAttempts) || 0)
+        })
+      );
+    } catch (_error) {
+      // Ignore storage errors.
+    }
+  }
+
+  function clearPersistedSingleExportPendingResume() {
+    try {
+      window.sessionStorage.removeItem(SINGLE_EXPORT_PENDING_RESUME_STORAGE_KEY);
+    } catch (_error) {
+      // Ignore storage errors.
+    }
+  }
+
+  function loadPersistedSingleExportPendingResume() {
+    try {
+      const raw = window.sessionStorage.getItem(SINGLE_EXPORT_PENDING_RESUME_STORAGE_KEY);
+      if (!raw) {
+        return null;
+      }
+
+      const parsed = JSON.parse(raw);
+      const requestedAt = Number(parsed?.requestedAt) || 0;
+      if (requestedAt <= 0 || (Date.now() - requestedAt) > SINGLE_EXPORT_PENDING_RESUME_MAX_AGE_MS) {
+        clearPersistedSingleExportPendingResume();
+        return null;
+      }
+
+      const format = normalizeSingleExportFormat(parsed?.format);
+      const detailedMetadata = normalizeDetailedMetadataOption(parsed?.detailedMetadata, format);
+      const reloadAttempts = Math.min(
+        SINGLE_EXPORT_TIMESTAMP_RELOAD_MAX_ATTEMPTS,
+        Math.max(0, Number(parsed?.reloadAttempts) || 0)
+      );
+
+      return {
+        format,
+        detailedMetadata,
+        routeGuard: cloneSingleExportRouteGuard(parsed?.routeGuard),
+        requestedAt,
+        reloadForTimestamps: Boolean(parsed?.reloadForTimestamps),
+        reloadAttempts
+      };
+    } catch (_error) {
+      clearPersistedSingleExportPendingResume();
+      return null;
+    }
+  }
+
+  function restoreSingleExportPendingResumeFromStorage() {
+    if (singleExportPendingResume) {
+      return;
+    }
+
+    const pendingResume = loadPersistedSingleExportPendingResume();
+    if (!pendingResume) {
+      return;
+    }
+
+    singleExportResumeGeneration += 1;
+    singleExportPendingResume = pendingResume;
+    runtimeOperation = "single-resume";
+    runtimeExportFormat = normalizeSingleExportFormat(pendingResume.format);
+    runtimeDetailedMetadata = normalizeDetailedMetadataOption(
+      pendingResume.detailedMetadata,
+      runtimeExportFormat
+    );
+    runtimeStartedAt = Number(pendingResume.requestedAt) || Date.now();
+    setSingleExportInteractionGuardActive(false);
+    startRuntimeHeartbeat();
+    persistRuntimeState(true);
+    scheduleSingleExportAutoResumeAttempt(SINGLE_EXPORT_AUTO_RESUME_DELAY_MS);
+  }
+
+  function scheduleSingleExportAutoResumeAttempt(delayMs = SINGLE_EXPORT_AUTO_RESUME_DELAY_MS) {
+    if (!singleExportPendingResume || isExporting || singleExportResumeAttemptInFlight) {
+      return;
+    }
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      return;
+    }
+    if (singleExportResumeTimer) {
+      return;
+    }
+
+    singleExportResumeTimer = setTimeout(() => {
+      singleExportResumeTimer = null;
+      void attemptSingleExportAutoResume();
+    }, Math.max(120, Number(delayMs) || SINGLE_EXPORT_AUTO_RESUME_DELAY_MS));
+  }
+
+  async function attemptSingleExportAutoResume() {
+    const pendingResume = singleExportPendingResume;
+    if (!pendingResume || isExporting || singleExportResumeAttemptInFlight) {
+      return;
+    }
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      return;
+    }
+
+    const attemptGeneration = singleExportResumeGeneration;
+    let rescheduleDelayMs = 0;
+    singleExportResumeAttemptInFlight = true;
+
+    try {
+      if (!isCurrentSingleExportPendingResume(attemptGeneration)) {
+        return;
+      }
+      assertSingleExportRouteGuard(pendingResume.routeGuard);
+      const ready = await waitForSingleExportAutoResumeReady(pendingResume.routeGuard, attemptGeneration);
+      if (!isCurrentSingleExportPendingResume(attemptGeneration)) {
+        return;
+      }
+      if (!ready) {
+        setStatus("Trying to resume saving this chat...", "busy");
+        rescheduleDelayMs = 1400;
+        return;
+      }
+
+      clearSingleExportPendingResume();
+      setStatus("Trying to resume saving this chat...", "busy");
+      await startExport("auto-resume", {
+        format: pendingResume.format,
+        detailedMetadata: pendingResume.detailedMetadata
+      });
+    } catch (error) {
+      if (!isCurrentSingleExportPendingResume(attemptGeneration)) {
+        return;
+      }
+      if (isExportContextChangedError(error)) {
+        clearSingleExportPendingResume();
+        setStatus(
+          "Could not resume because the open chat changed. Open the same chat and save again.",
+          "error",
+          12000
+        );
+        return;
+      }
+
+      console.error("[ChatGPT Export] Auto-resume failed:", error);
+      setStatus("Trying to resume was interrupted. Waiting a moment and trying again...", "busy");
+      rescheduleDelayMs = 1800;
+    } finally {
+      singleExportResumeAttemptInFlight = false;
+      if (rescheduleDelayMs > 0 && isCurrentSingleExportPendingResume(attemptGeneration) && !isExporting) {
+        scheduleSingleExportAutoResumeAttempt(rescheduleDelayMs);
+      }
+    }
+  }
+
+  function isCurrentSingleExportPendingResume(resumeGeneration) {
+    return Boolean(singleExportPendingResume) && singleExportResumeGeneration === Number(resumeGeneration);
+  }
+
+  async function waitForSingleExportAutoResumeReady(routeGuard, resumeGeneration) {
+    const startedAt = Date.now();
+    let lastNoticeAt = 0;
+
+    while ((Date.now() - startedAt) < 12000) {
+      if (!isCurrentSingleExportPendingResume(resumeGeneration)) {
+        return false;
+      }
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        return false;
+      }
+      assertSingleExportRouteGuard(routeGuard);
+
+      if (!isConversationPage()) {
+        await sleep(360);
+        continue;
+      }
+
+      const messageCount = countDomMessages();
+      const scroller = findConversationScroller();
+      const loadingActive = hasActiveThreadLoadingIndicators(scroller);
+      if (messageCount > 0) {
+        return true;
+      }
+
+      const now = Date.now();
+      if ((now - lastNoticeAt) >= 2500) {
+        setStatus("Trying to resume... waiting for this chat to finish loading again.", "busy");
+        lastNoticeAt = now;
+      }
+
+      await sleep(360);
+    }
+
+    return false;
   }
 
   function buildRuntimeStateSnapshot() {
@@ -2873,10 +4055,14 @@ ${eventRows}
     const batchProgress = buildBatchProgressSnapshot(activeBatchState);
 
     return {
-      isExporting: Boolean(isExporting),
+      isExporting: Boolean(isExporting || singleExportPendingResume),
       isBatchRunning: Boolean(batchRunContext && batchRunContext.running),
       hasBatchResume: hasResumableBatchState(savedBatchState),
+      pageUrl: String(window.location.href || ""),
+      conversationId: String(getConversationIdFromPath() || ""),
       operation: runtimeOperation,
+      exportFormat: normalizeSingleExportFormat(runtimeExportFormat),
+      detailedMetadata: normalizeDetailedMetadataOption(runtimeDetailedMetadata, runtimeExportFormat),
       statusMessage: runtimeStatusMessage,
       statusKind: runtimeStatusKind,
       statusUpdatedAt: Number(runtimeStatusUpdatedAt) || 0,
@@ -2888,7 +4074,9 @@ ${eventRows}
       batchDoneCount: Number(batchProgress?.doneCount) || 0,
       batchSuccessCount: Number(batchProgress?.successCount) || 0,
       batchFailureCount: Number(batchProgress?.failureCount) || 0,
-      batchSkippedCount: Number(batchProgress?.skippedCount) || 0
+      batchSkippedCount: Number(batchProgress?.skippedCount) || 0,
+      batchExportFormat: normalizeSingleExportFormat(activeBatchState?.options?.format),
+      batchDetailedMetadata: normalizeDetailedMetadataOption(activeBatchState?.options?.detailedMetadata, activeBatchState?.options?.format)
     };
   }
 
@@ -2911,7 +4099,7 @@ ${eventRows}
   }
 
   function persistRuntimeState(force = false) {
-    if (!chrome?.storage?.local) {
+    if (!chrome?.runtime?.sendMessage) {
       return;
     }
 
@@ -2935,15 +4123,16 @@ ${eventRows}
   }
 
   function flushRuntimeStateNow() {
-    if (!chrome?.storage?.local) {
+    if (!chrome?.runtime?.sendMessage) {
       return;
     }
 
     const snapshot = buildRuntimeStateSnapshot();
     try {
-      chrome.storage.local.set(
+      chrome.runtime.sendMessage(
         {
-          [RUNTIME_STATE_STORAGE_KEY]: snapshot
+          type: "chatgpt-export-runtime-state-update",
+          snapshot
         },
         () => {
           void chrome.runtime?.lastError;
@@ -2952,6 +4141,29 @@ ${eventRows}
     } catch (_error) {
       // Ignore storage write errors.
     }
+  }
+
+  function installRuntimeStateCleanupListener() {
+    const clearRuntimeState = () => {
+      if (runtimeStateFlushTimer) {
+        clearTimeout(runtimeStateFlushTimer);
+        runtimeStateFlushTimer = null;
+      }
+      stopRuntimeHeartbeat();
+      try {
+        chrome.runtime?.sendMessage?.(
+          { type: "chatgpt-export-runtime-state-clear" },
+          () => {
+            void chrome.runtime?.lastError;
+          }
+        );
+      } catch (_error) {
+        // Ignore runtime cleanup errors during unload.
+      }
+    };
+
+    window.addEventListener("pagehide", clearRuntimeState);
+    window.addEventListener("beforeunload", clearRuntimeState);
   }
 
   function scheduleBatchAutoResume() {
@@ -2985,9 +4197,9 @@ ${eventRows}
       ? (totalLikelyReliable
         ? String(totalKnown)
         : (String(totalKnown) + " (currently loaded, there may be more)"))
-      : "unbekannt";
+      : "unknown";
     const input = window.prompt(
-      "Batch export started.\nTotal threads: " + label + ".\nHow many should be exported?\nLeave empty = all.",
+      "Multi-chat save started.\nChats found: " + label + ".\nHow many chats should be saved?\nLeave blank = all.",
       ""
     );
 
@@ -3002,7 +4214,7 @@ ${eventRows}
 
     const parsed = Number(trimmed);
     if (!Number.isFinite(parsed) || parsed <= 0) {
-      throw new Error("Please enter a positive number for batch export.");
+      throw new Error("Please enter a number greater than 0.");
     }
 
     return Math.floor(parsed);
@@ -3032,35 +4244,58 @@ ${eventRows}
     return false;
   }
 
-  async function collectConversationMetasForBatch(requestedCount, firstPage, progressCallback) {
+  async function collectConversationMetasForBatch(requestedCount, firstPage, progressCallback, options = {}) {
     const targetCount = Number.isFinite(requestedCount)
       ? requestedCount
       : Number.POSITIVE_INFINITY;
+    const wantsAllChats = !Number.isFinite(requestedCount);
+    const isCancelled = typeof options?.isCancelled === "function" ? options.isCancelled : () => false;
 
     const seen = new Set();
     const collected = [];
 
-    firstPage.items.forEach((item) => {
-      if (!item.id || seen.has(item.id)) {
-        return;
-      }
-      seen.add(item.id);
-      collected.push(item);
-    });
+    throwIfExportCancelled(isCancelled);
+    appendUniqueConversationMetas(collected, seen, firstPage.items);
 
     let offset = firstPage.nextOffset;
     let hasMore = firstPage.hasMore;
     let totalKnown = firstPage.total;
     let pageNumber = 1;
 
-    while (hasMore && collected.length < targetCount && pageNumber < BATCH_MAX_PAGES) {
+    // The paginated conversations API is kept only as a fallback.
+    // In production it proved less robust than the sidebar sweep for "all chats":
+    // it can keep paging with misleading totals/offsets and inflate counts.
+    const sidebarAvailable = Boolean(findSidebarConversationScroller());
+    if (collected.length < targetCount && sidebarAvailable) {
+      progressCallback("Looking for more chats in the sidebar...", "busy");
+      const sidebarItems = await collectConversationMetasFromSidebarSweep({
+        knownIds: seen,
+        targetCount,
+        progressCallback,
+        isCancelled
+      });
+      throwIfExportCancelled(isCancelled);
+      appendUniqueConversationMetas(collected, seen, sidebarItems);
+    }
+
+    let stagnantApiPages = 0;
+    while (
+      hasMore &&
+      collected.length < targetCount &&
+      pageNumber < BATCH_MAX_PAGES &&
+      (!wantsAllChats || !sidebarAvailable)
+    ) {
+      throwIfExportCancelled(isCancelled);
       pageNumber += 1;
       progressCallback(
-        "Batch: Loading thread list (" + collected.length + " collected, page " + pageNumber + ")...",
+        "Loading more chats from the list API (" + collected.length + " found, page " + pageNumber + ")...",
         "busy"
       );
 
+      const previousOffset = Math.max(0, Number(offset) || 0);
+      const countBeforePage = collected.length;
       const payload = await fetchConversationListPage(offset, BATCH_LIST_PAGE_LIMIT, progressCallback);
+      throwIfExportCancelled(isCancelled);
       const page = normalizeConversationListPage(payload, offset, BATCH_LIST_PAGE_LIMIT);
 
       if (Number.isFinite(page.total)) {
@@ -3071,13 +4306,7 @@ ${eventRows}
         break;
       }
 
-      page.items.forEach((item) => {
-        if (!item.id || seen.has(item.id)) {
-          return;
-        }
-        seen.add(item.id);
-        collected.push(item);
-      });
+      appendUniqueConversationMetas(collected, seen, page.items);
 
       offset = page.nextOffset;
       hasMore = page.hasMore;
@@ -3085,27 +4314,31 @@ ${eventRows}
       if (Number.isFinite(totalKnown) && offset >= totalKnown) {
         hasMore = false;
       }
+
+      const addedCount = collected.length - countBeforePage;
+      const offsetAdvanced = Math.max(0, Number(offset) || 0) > previousOffset;
+      if (addedCount <= 0 || !offsetAdvanced) {
+        stagnantApiPages += 1;
+      } else {
+        stagnantApiPages = 0;
+      }
+
+      if (stagnantApiPages >= 2) {
+        break;
+      }
     }
 
-    if (collected.length < targetCount) {
-      progressCallback("Batch: Scanning sidebar to load more threads...", "busy");
+    if (collected.length < targetCount && !sidebarAvailable) {
+      progressCallback("Looking for more chats in the sidebar...", "busy");
       const sidebarItems = await collectConversationMetasFromSidebarSweep({
         knownIds: seen,
         targetCount,
-        progressCallback
+        progressCallback,
+        isCancelled
       });
+      throwIfExportCancelled(isCancelled);
 
-      for (let index = 0; index < sidebarItems.length; index += 1) {
-        const item = sidebarItems[index];
-        if (!item?.id || seen.has(item.id)) {
-          continue;
-        }
-        seen.add(item.id);
-        collected.push(item);
-        if (collected.length >= targetCount) {
-          break;
-        }
-      }
+      appendUniqueConversationMetas(collected, seen, sidebarItems);
     }
 
     const limited = collected.slice(0, targetCount);
@@ -3113,6 +4346,26 @@ ${eventRows}
       total: totalKnown,
       items: limited
     };
+  }
+
+  function appendUniqueConversationMetas(target, seen, items) {
+    if (!Array.isArray(target) || !(seen instanceof Set) || !Array.isArray(items)) {
+      return 0;
+    }
+
+    let added = 0;
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
+      const id = String(item?.id || "").trim();
+      if (!id || seen.has(id)) {
+        continue;
+      }
+      seen.add(id);
+      target.push(item);
+      added += 1;
+    }
+
+    return added;
   }
 
   async function fetchConversationListPage(offset, limit, progressCallback) {
@@ -3124,7 +4377,7 @@ ${eventRows}
 
     for (let attempt = 1; attempt <= BATCH_LIST_MAX_RETRIES; attempt += 1) {
       if (progressCallback && attempt > 1) {
-        progressCallback("Batch: List retry " + attempt + "/" + BATCH_LIST_MAX_RETRIES + "...", "busy");
+        progressCallback("Trying the chat list again (" + attempt + "/" + BATCH_LIST_MAX_RETRIES + ")...", "busy");
       }
 
       for (let endpointIndex = 0; endpointIndex < endpointCandidates.length; endpointIndex += 1) {
@@ -3169,7 +4422,7 @@ ${eventRows}
       return lastSuccessfulBody;
     }
 
-    throw lastError || new Error("Thread list could not be loaded.");
+    throw lastError || new Error("The chat list could not be loaded.");
   }
 
   function buildConversationListEndpointCandidates(offset, limit) {
@@ -3426,7 +4679,7 @@ ${eventRows}
     return items;
   }
 
-  async function collectConversationMetasFromSidebarSweep({ knownIds, targetCount, progressCallback }) {
+  async function collectConversationMetasFromSidebarSweep({ knownIds, targetCount, progressCallback, isCancelled }) {
     const seen = new Set(knownIds instanceof Set ? Array.from(knownIds) : []);
     const collected = [];
     const passLimit = computeSidebarSweepPassLimit(targetCount);
@@ -3458,13 +4711,15 @@ ${eventRows}
     let previousHeight = Number(scroller.scrollHeight) || 0;
 
     for (let pass = 1; pass <= passLimit; pass += 1) {
-      const visibleReady = await waitForSidebarSweepVisibility(progressCallback, "Sidebar-Scan");
+      throwIfExportCancelled(isCancelled);
+      const visibleReady = await waitForSidebarSweepVisibility(progressCallback, "Sidebar-Scan", isCancelled);
       if (!visibleReady) {
         throw createSidebarSweepHiddenTimeoutError();
       }
 
       setScrollerTop(scroller, getScrollerMaxTop(scroller));
       await sleep(SIDEBAR_SWEEP_SETTLE_MS);
+      throwIfExportCancelled(isCancelled);
       collectVisible();
 
       const currentCount = collected.length;
@@ -3483,7 +4738,7 @@ ${eventRows}
 
       if (pass % 10 === 0) {
         progressCallback(
-          "Batch: Sidebar scan pass " + pass + " (" + collected.length + " additional threads found)...",
+          "Looking for more chats in the sidebar (" + collected.length + " more found, pass " + pass + ")...",
           "busy"
         );
       }
@@ -3493,14 +4748,16 @@ ${eventRows}
           scroller,
           collectVisible,
           () => collected.length,
-          progressCallback
+          progressCallback,
+          isCancelled
         );
         if (!sawGrowth) {
           const recoveredByNudge = await verifySidebarEndByNudging(
             scroller,
             collectVisible,
             () => collected.length,
-            progressCallback
+            progressCallback,
+            isCancelled
           );
           if (!recoveredByNudge) {
             break;
@@ -3533,7 +4790,7 @@ ${eventRows}
     return SIDEBAR_SWEEP_MAX_PASSES_CAP;
   }
 
-  async function waitForSidebarConversationGrowth(scroller, collectVisible, getAdditionalCount, progressCallback) {
+  async function waitForSidebarConversationGrowth(scroller, collectVisible, getAdditionalCount, progressCallback, isCancelled) {
     const startedAt = Date.now();
     const baselineCount = Math.max(0, Number(
       typeof getAdditionalCount === "function" ? getAdditionalCount() : 0
@@ -3542,12 +4799,14 @@ ${eventRows}
     let lastPulseAt = 0;
 
     while ((Date.now() - startedAt) < SIDEBAR_SWEEP_WAIT_MS) {
-      const visibleReady = await waitForSidebarSweepVisibility(progressCallback, "Sidebar reload");
+      throwIfExportCancelled(isCancelled);
+      const visibleReady = await waitForSidebarSweepVisibility(progressCallback, "Sidebar reload", isCancelled);
       if (!visibleReady) {
         throw createSidebarSweepHiddenTimeoutError();
       }
 
       await sleep(SIDEBAR_SWEEP_POLL_MS);
+      throwIfExportCancelled(isCancelled);
       collectVisible();
 
       const currentHeight = Number(scroller?.scrollHeight) || 0;
@@ -3560,7 +4819,7 @@ ${eventRows}
 
       const now = Date.now();
       if ((now - lastPulseAt) >= 2400) {
-        progressCallback("Batch: waiting for sidebar threads to load...", "busy");
+        progressCallback("Waiting for more chats to appear...", "busy");
         lastPulseAt = now;
       }
     }
@@ -3568,13 +4827,14 @@ ${eventRows}
     return false;
   }
 
-  async function verifySidebarEndByNudging(scroller, collectVisible, getAdditionalCount, progressCallback) {
+  async function verifySidebarEndByNudging(scroller, collectVisible, getAdditionalCount, progressCallback, isCancelled) {
     if (!scroller) {
       return false;
     }
 
     for (let round = 1; round <= SIDEBAR_SWEEP_END_VERIFY_ROUNDS; round += 1) {
-      const visibleReady = await waitForSidebarSweepVisibility(progressCallback, "Sidebar-Ende-Pruefung");
+      throwIfExportCancelled(isCancelled);
+      const visibleReady = await waitForSidebarSweepVisibility(progressCallback, "Sidebar-Ende-Pruefung", isCancelled);
       if (!visibleReady) {
         throw createSidebarSweepHiddenTimeoutError();
       }
@@ -3592,17 +4852,19 @@ ${eventRows}
 
       if (typeof progressCallback === "function") {
         progressCallback(
-          "Batch: checking sidebar end (" + round + "/" + SIDEBAR_SWEEP_END_VERIFY_ROUNDS + ")...",
+          "Checking whether more chats are still loading (" + round + "/" + SIDEBAR_SWEEP_END_VERIFY_ROUNDS + ")...",
           "busy"
         );
       }
 
       setScrollerTop(scroller, upTop);
       await sleep(SIDEBAR_SWEEP_NUDGE_WAIT_MS);
+      throwIfExportCancelled(isCancelled);
       collectVisible();
 
       setScrollerTop(scroller, getScrollerMaxTop(scroller));
       await sleep(SIDEBAR_SWEEP_NUDGE_WAIT_MS + 80);
+      throwIfExportCancelled(isCancelled);
       collectVisible();
 
       const afterCount = Math.max(0, Number(
@@ -3617,7 +4879,8 @@ ${eventRows}
         scroller,
         collectVisible,
         getAdditionalCount,
-        progressCallback
+        progressCallback,
+        isCancelled
       );
       if (waitedGrowth) {
         return true;
@@ -3629,13 +4892,13 @@ ${eventRows}
 
   function createSidebarSweepHiddenTimeoutError() {
     const error = new Error(
-      "Sidebar scan paused: ChatGPT tab stayed in the background too long. Bring the tab to foreground and start batch again."
+      "The chat list stopped loading because the ChatGPT tab was hidden too long. Bring it back to the front and start again."
     );
     error.code = "sidebar_hidden_timeout";
     return error;
   }
 
-  async function waitForSidebarSweepVisibility(progressCallback, phaseLabel) {
+  async function waitForSidebarSweepVisibility(progressCallback, phaseLabel, isCancelled) {
     if (typeof document === "undefined" || document.visibilityState !== "hidden") {
       return true;
     }
@@ -3645,6 +4908,7 @@ ${eventRows}
     const label = String(phaseLabel || "Sidebar-Scan").trim() || "Sidebar-Scan";
 
     while (document.visibilityState === "hidden") {
+      throwIfExportCancelled(isCancelled);
       const now = Date.now();
       if ((now - startedAt) >= SIDEBAR_SWEEP_HIDDEN_WAIT_MAX_MS) {
         return false;
@@ -3653,7 +4917,7 @@ ${eventRows}
       if ((now - lastNoticeAt) >= SIDEBAR_SWEEP_HIDDEN_NOTICE_MS) {
         if (typeof progressCallback === "function") {
           progressCallback(
-            "Batch: " + label + " waiting, keep the ChatGPT tab in foreground...",
+            label + ": keep this ChatGPT tab visible while more chats load...",
             "busy"
           );
         }
@@ -3788,7 +5052,7 @@ ${eventRows}
       let attemptHitRateLimit = false;
       try {
         if (typeof progressCallback === "function") {
-          progressCallback(contextLabel + " Versuch " + attempt + "/" + maxRetries + "...", "busy");
+          progressCallback(contextLabel + " (" + attempt + "/" + maxRetries + ")...", "busy");
         }
 
         for (let endpointIndex = 0; endpointIndex < endpointCandidates.length; endpointIndex += 1) {
@@ -4118,7 +5382,13 @@ ${eventRows}
 
   async function ensurePageBridge() {
     if (pageBridgeReadyPromise) {
-      return pageBridgeReadyPromise;
+      try {
+        await pageBridgeReadyPromise;
+        return pageBridgeReadyPromise;
+      } catch (_previousError) {
+        // Previous attempt failed — allow a fresh retry.
+        pageBridgeReadyPromise = null;
+      }
     }
 
     pageBridgeReadyPromise = new Promise((resolve, reject) => {
@@ -4278,15 +5548,22 @@ ${eventRows}
         return;
       }
 
-      const messageId = String(message.id || node.id || "msg-" + index);
+      const timestampKeys = collectTimestampAliasKeys([
+        message?.id,
+        node?.id
+      ], "msg-" + index);
       const timestamp = normalizeTimestamp(message?.create_time || message?.update_time);
-      if (!timestamp) {
+      if (!timestamp || timestampKeys.length === 0) {
         return;
       }
 
-      timestampMap.set(messageId, {
+      const timestampInfo = {
         iso: timestamp.toISOString(),
         display: formatTimestamp(timestamp)
+      };
+
+      timestampKeys.forEach((messageId) => {
+        timestampMap.set(messageId, timestampInfo);
       });
     });
 
@@ -4304,7 +5581,8 @@ ${eventRows}
     );
 
     messageNodes.forEach((messageNode) => {
-      const messageId = messageNode.getAttribute("data-message-id") || "";
+      const turn = messageNode.closest("article[data-testid^='conversation-turn-'], article[data-turn-id]");
+      const messageId = getDomMessageId(messageNode, turn, "");
       const current = getDirectChildByClass(messageNode, INLINE_TS_CLASS);
       const timestampInfo = resolveNodeTimestamp(messageNode, messageId);
       if (!timestampInfo) {
@@ -4412,7 +5690,10 @@ ${eventRows}
     }
 
     if (pieces.length === 0 && typeof message?.text === "string") {
-      pieces.push(message.text);
+      const normalizedText = normalizeApiDisplayTextCandidate(message.text);
+      if (normalizedText) {
+        pieces.push(normalizedText);
+      }
     }
 
     return pieces.join("\n\n").trim();
@@ -4424,7 +5705,7 @@ ${eventRows}
     }
 
     if (typeof part === "string") {
-      return part.trim();
+      return normalizeApiDisplayTextCandidate(part);
     }
 
     if (Array.isArray(part)) {
@@ -4433,11 +5714,11 @@ ${eventRows}
 
     if (typeof part === "object") {
       if (typeof part.text === "string") {
-        return part.text.trim();
+        return normalizeApiDisplayTextCandidate(part.text);
       }
 
       if (typeof part.content === "string") {
-        return part.content.trim();
+        return normalizeApiDisplayTextCandidate(part.content);
       }
 
       if (Array.isArray(part.parts)) {
@@ -4472,6 +5753,34 @@ ${eventRows}
       out.push(safe);
     };
 
+    const maybeAddObjectUrls = (part) => {
+      if (!part || typeof part !== "object") {
+        return;
+      }
+
+      const type = String(part.type || part.content_type || "").toLowerCase();
+      const mimeType = String(part.mime_type || part.mimeType || "").toLowerCase();
+      const looksImageLike =
+        type.includes("image") ||
+        type.includes("asset") ||
+        type.includes("attachment") ||
+        type.includes("gallery") ||
+        mimeType.startsWith("image/");
+
+      if (!looksImageLike) {
+        return;
+      }
+
+      addUrl(part?.image_url?.url || "");
+      addUrl(part?.url || "");
+      addUrl(part?.src || "");
+      addUrl(part?.href || "");
+      addUrl(part?.download_url || part?.downloadUrl || "");
+      addUrl(part?.preview_url || part?.previewUrl || "");
+      addUrl(part?.thumbnail_url || part?.thumbnailUrl || "");
+      addUrl(part?.file_url || part?.fileUrl || "");
+    };
+
     const walk = (part) => {
       if (part == null) {
         return;
@@ -4489,6 +5798,8 @@ ${eventRows}
       if (typeof part !== "object") {
         return;
       }
+
+      maybeAddObjectUrls(part);
 
       if (part.type === "image_url") {
         addUrl(part?.image_url?.url || part?.url || "");
@@ -4514,6 +5825,18 @@ ${eventRows}
       } else if (part.content && typeof part.content === "object") {
         walk(part.content);
       }
+
+      if (Array.isArray(part.attachments)) {
+        part.attachments.forEach(walk);
+      }
+
+      if (Array.isArray(part.items)) {
+        part.items.forEach(walk);
+      }
+
+      if (part.metadata && typeof part.metadata === "object") {
+        walk(part.metadata);
+      }
     };
 
     if (Array.isArray(content?.parts)) {
@@ -4523,6 +5846,197 @@ ${eventRows}
     }
 
     return out;
+  }
+
+  function normalizeApiDisplayTextCandidate(value) {
+    const raw = String(value || "").trim();
+    if (!raw) {
+      return "";
+    }
+    if (isLikelyGeneratedImageConfigText(raw)) {
+      return "";
+    }
+    return raw;
+  }
+
+  function isLikelyGeneratedImageConfigText(value) {
+    const raw = String(value || "").trim();
+    if (!raw.startsWith("{") || !raw.endsWith("}")) {
+      return false;
+    }
+
+    try {
+      return isLikelyGeneratedImageConfigObject(JSON.parse(raw));
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function isLikelyGeneratedImageConfigObject(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return false;
+    }
+
+    const keys = Object.keys(value);
+    if (keys.length === 0 || !keys.includes("size")) {
+      return false;
+    }
+
+    const signals = [
+      "n",
+      "transparent_background",
+      "is_style_transfer",
+      "referenced_image_ids",
+      "background",
+      "output_format",
+      "quality",
+      "prompt"
+    ];
+    let score = 0;
+    for (let index = 0; index < signals.length; index += 1) {
+      if (Object.prototype.hasOwnProperty.call(value, signals[index])) {
+        score += 1;
+      }
+    }
+
+    return score >= 2;
+  }
+
+  function shouldUseDomFallbackForApiPayload(payload) {
+    const mapping = payload?.mapping;
+    if (!mapping || typeof mapping !== "object") {
+      return false;
+    }
+
+    const chainIds = resolveCurrentBranchIds(mapping, payload?.current_node);
+    const rawNodes = chainIds.length > 0
+      ? chainIds.map((id) => mapping[id]).filter(Boolean)
+      : Object.values(mapping);
+
+    for (let index = 0; index < rawNodes.length; index += 1) {
+      const message = rawNodes[index]?.message;
+      if (!message) {
+        continue;
+      }
+
+      const text = extractApiMessageText(message);
+      const imageUrls = extractApiMessageImageUrls(message);
+      if (apiMessageNeedsDomFallback(message, text, imageUrls)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function apiMessageNeedsDomFallback(message, text, imageUrls) {
+    const urls = Array.isArray(imageUrls) ? imageUrls.filter(Boolean) : [];
+    if (urls.length > 0) {
+      return false;
+    }
+
+    if (messageContainsGeneratedImageConfig(message) || isLikelyGeneratedImageConfigText(text)) {
+      return true;
+    }
+
+    return hasUnresolvedApiRichContent(message?.content);
+  }
+
+  function messageContainsGeneratedImageConfig(message) {
+    if (!message || typeof message !== "object") {
+      return false;
+    }
+
+    if (containsGeneratedImageConfigValue(message?.content)) {
+      return true;
+    }
+
+    return containsGeneratedImageConfigValue(message?.text);
+  }
+
+  function containsGeneratedImageConfigValue(value, depth = 0) {
+    if (value == null || depth > 8) {
+      return false;
+    }
+
+    if (typeof value === "string") {
+      return isLikelyGeneratedImageConfigText(value);
+    }
+
+    if (Array.isArray(value)) {
+      return value.some((entry) => containsGeneratedImageConfigValue(entry, depth + 1));
+    }
+
+    if (typeof value !== "object") {
+      return false;
+    }
+
+    if (typeof value.text === "string" && isLikelyGeneratedImageConfigText(value.text)) {
+      return true;
+    }
+
+    if (typeof value.content === "string" && isLikelyGeneratedImageConfigText(value.content)) {
+      return true;
+    }
+
+    const keys = Object.keys(value);
+    for (let index = 0; index < keys.length; index += 1) {
+      if (containsGeneratedImageConfigValue(value[keys[index]], depth + 1)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function hasUnresolvedApiRichContent(value, depth = 0) {
+    if (value == null || depth > 8) {
+      return false;
+    }
+
+    if (typeof value === "string") {
+      return false;
+    }
+
+    if (Array.isArray(value)) {
+      return value.some((entry) => hasUnresolvedApiRichContent(entry, depth + 1));
+    }
+
+    if (typeof value !== "object") {
+      return false;
+    }
+
+    const type = String(value.type || value.content_type || "").toLowerCase();
+    if (type && type !== "image_url") {
+      if (
+        type.includes("image") ||
+        type.includes("multimodal") ||
+        type.includes("attachment") ||
+        type.includes("asset") ||
+        type.includes("gallery")
+      ) {
+        return true;
+      }
+    }
+
+    if (
+      typeof value.asset_pointer === "string" ||
+      typeof value.assetPointer === "string" ||
+      typeof value.file_id === "string" ||
+      typeof value.fileId === "string"
+    ) {
+      return true;
+    }
+
+    const keys = Object.keys(value);
+    for (let index = 0; index < keys.length; index += 1) {
+      const child = value[keys[index]];
+      if (hasUnresolvedApiRichContent(child, depth + 1)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   function buildApiMessageBodyHtml(text, imageUrls) {
@@ -4553,21 +6067,28 @@ ${eventRows}
     const conversationId = getConversationIdFromPath() || "";
     const allowExtendedWait = Boolean(options?.allowExtendedWait);
     const isCancelled = typeof options?.isCancelled === "function" ? options.isCancelled : () => false;
+    const routeGuard = options?.routeGuard || null;
+    const observedTimestampFallbackMap = options?.observedTimestampFallbackMap instanceof Map
+      ? options.observedTimestampFallbackMap
+      : getObservedTimestampFallbackMap(conversationId);
+    const waitForVisibility = () => waitForSingleExportVisibility({
+      progressCallback,
+      isCancelled,
+      routeGuard
+    });
     const scroller = findConversationScroller();
     const startScrollTop = scroller ? getScrollerTop(scroller) : null;
     const collected = new Map();
     let orderCounter = 0;
 
     const collectNow = () => {
+      assertSingleExportRouteGuard(routeGuard);
       const turns = document.querySelectorAll("article[data-testid^='conversation-turn-'], article[data-turn-id]");
-      const recentTurnCutoff = Math.max(0, turns.length - 8);
       turns.forEach((turn, turnIndex) => {
         const messageNodes = turn.querySelectorAll("[data-message-author-role]");
         const turnMessageIds = [];
         messageNodes.forEach((messageNode, localIndex) => {
-          const messageId = messageNode.getAttribute("data-message-id") ||
-            turn.getAttribute("data-turn-id") ||
-            "dom-" + turnIndex + "-" + localIndex;
+          const messageId = getDomMessageId(messageNode, turn, "dom-" + turnIndex + "-" + localIndex);
 
           const roleRaw = messageNode.getAttribute("data-message-author-role") || turn.getAttribute("data-turn") || "unknown";
           const role = normalizeRole(roleRaw);
@@ -4596,20 +6117,9 @@ ${eventRows}
           }
 
           if (!timestampInfo && conversationId && messageId) {
-            const observedFallbackMap = getObservedTimestampFallbackMap(conversationId);
-            const knownObserved = observedFallbackMap?.get(messageId) || null;
+            const knownObserved = observedTimestampFallbackMap?.get(messageId) || null;
             if (knownObserved) {
               timestampInfo = knownObserved;
-            } else if (!isBaselineMessageId(conversationId, messageId) && turnIndex >= recentTurnCutoff) {
-              const now = new Date();
-              const generated = {
-                iso: now.toISOString(),
-                display: formatTimestamp(now)
-              };
-              if (observedFallbackMap) {
-                observedFallbackMap.set(messageId, generated);
-              }
-              timestampInfo = generated;
             }
           }
 
@@ -4683,22 +6193,34 @@ ${eventRows}
     };
 
     collectNow();
+    await waitForVisibility();
 
     if (scroller) {
       const endSyncPassLimit = computeDomScrollPassLimit(scroller, {
         minPasses: DOM_BOTTOM_STABLE_PASSES * 12
       });
-      await ensureThreadEndLoaded(scroller, collectNow, progressCallback, {
+      const threadEndReady = await ensureThreadEndLoaded(scroller, collectNow, progressCallback, {
         allowExtendedWait,
         isCancelled,
-        passLimit: endSyncPassLimit
+        passLimit: endSyncPassLimit,
+        assertContextStable: () => assertSingleExportRouteGuard(routeGuard),
+        waitForVisibility
       });
+      if (!threadEndReady) {
+        throw createExportIntegrityError(
+          "The newest part of the chat did not finish loading.",
+          "export_integrity_thread_end_incomplete"
+        );
+      }
+      assertSingleExportRouteGuard(routeGuard);
+      await waitForVisibility();
       collectNow();
 
       let stalePasses = 0;
       let longWaitAttempts = 0;
       let previousTop = getScrollerTop(scroller);
       let previousCount = collected.size;
+      let reachedTopFully = false;
       const historyPassLimit = computeDomScrollPassLimit(scroller, {
         minPasses: DOM_SCROLL_MAX_PASSES
       });
@@ -4707,15 +6229,19 @@ ${eventRows}
         if (isCancelled()) {
           throw createExportCancelledError();
         }
+        assertSingleExportRouteGuard(routeGuard);
+        await waitForVisibility();
 
         const step = Math.max(DOM_SCROLL_STEP_MIN, Math.floor(getScrollerClientHeight(scroller) * 0.85));
         const nextTop = Math.max(0, getScrollerTop(scroller) - step);
         setScrollerTop(scroller, nextTop);
         await sleep(DOM_SCROLL_SETTLE_MS);
+        await waitForVisibility();
+        assertSingleExportRouteGuard(routeGuard);
         collectNow();
 
         if (pass % 10 === 0) {
-          progressCallback("DOM fallback: loading long history (pass " + pass + ")...", "busy");
+          progressCallback("Loading older messages... (" + pass + ")", "busy");
         }
 
         const currentTop = getScrollerTop(scroller);
@@ -4744,6 +6270,8 @@ ${eventRows}
               collected,
               progressCallback,
               isCancelled,
+              assertContextStable: () => assertSingleExportRouteGuard(routeGuard),
+              waitForVisibility,
               stageLabel: "Historie",
               passLabel: longWaitAttempts + "/" + DOM_LONG_WAIT_RESCAN_LIMIT
             });
@@ -4757,6 +6285,7 @@ ${eventRows}
         }
 
         if (reachedTop && stalePasses >= DOM_TOP_STABLE_PASSES) {
+          reachedTopFully = true;
           break;
         }
         if (!reachedTop && stalePasses >= DOM_SCROLL_IDLE_LIMIT) {
@@ -4772,8 +6301,24 @@ ${eventRows}
       } else {
         setScrollerTop(scroller, getScrollerMaxTop(scroller));
       }
+      await waitForVisibility();
       await sleep(100);
+      assertSingleExportRouteGuard(routeGuard);
       collectNow();
+
+      if (!reachedTopFully) {
+        throw createExportIntegrityError(
+          "Older messages could not be fully loaded.",
+          "export_integrity_history_incomplete"
+        );
+      }
+
+      if (hasActiveThreadLoadingIndicators(scroller)) {
+        throw createExportIntegrityError(
+          "The chat is still loading new content.",
+          "export_integrity_thread_active"
+        );
+      }
     }
 
     return Array.from(collected.values())
@@ -4822,6 +6367,8 @@ ${eventRows}
   async function ensureThreadEndLoaded(scroller, collectNow, progressCallback, options = {}) {
     const allowExtendedWait = Boolean(options?.allowExtendedWait);
     const isCancelled = typeof options?.isCancelled === "function" ? options.isCancelled : () => false;
+    const assertContextStable = typeof options?.assertContextStable === "function" ? options.assertContextStable : null;
+    const waitForVisibility = typeof options?.waitForVisibility === "function" ? options.waitForVisibility : null;
     const passLimit = Math.max(
       DOM_BOTTOM_STABLE_PASSES * 4,
       Number(options?.passLimit) || DOM_SCROLL_MAX_PASSES
@@ -4829,14 +6376,27 @@ ${eventRows}
     let stablePasses = 0;
     let longWaitAttempts = 0;
     let previousTop = getScrollerTop(scroller);
+    let reachedStableBottom = false;
 
     for (let pass = 1; pass <= passLimit; pass += 1) {
       if (isCancelled()) {
         throw createExportCancelledError();
       }
+      if (assertContextStable) {
+        assertContextStable();
+      }
+      if (waitForVisibility) {
+        await waitForVisibility();
+      }
 
       setScrollerTop(scroller, getScrollerMaxTop(scroller));
       await sleep(DOM_SCROLL_SETTLE_MS);
+      if (waitForVisibility) {
+        await waitForVisibility();
+      }
+      if (assertContextStable) {
+        assertContextStable();
+      }
       collectNow();
 
       const currentTop = getScrollerTop(scroller);
@@ -4858,6 +6418,8 @@ ${eventRows}
           collected: null,
           progressCallback,
           isCancelled,
+          assertContextStable,
+          waitForVisibility,
           stageLabel: "Conversation end",
           passLabel: longWaitAttempts + "/" + DOM_LONG_WAIT_RESCAN_LIMIT
         });
@@ -4869,15 +6431,18 @@ ${eventRows}
       }
 
       if (stablePasses >= DOM_BOTTOM_STABLE_PASSES) {
+        reachedStableBottom = true;
         break;
       }
 
       if (pass % 12 === 0) {
-        progressCallback("DOM fallback: synchronizing conversation end...", "busy");
+        progressCallback("Checking for more messages...", "busy");
       }
 
       previousTop = currentTop;
     }
+
+    return reachedStableBottom;
   }
 
   async function waitForSlowDomGrowth({
@@ -4886,6 +6451,8 @@ ${eventRows}
     collected,
     progressCallback,
     isCancelled,
+    assertContextStable,
+    waitForVisibility,
     stageLabel,
     passLabel
   }) {
@@ -4900,8 +6467,20 @@ ${eventRows}
       if (typeof isCancelled === "function" && isCancelled()) {
         throw createExportCancelledError();
       }
+      if (typeof assertContextStable === "function") {
+        assertContextStable();
+      }
+      if (typeof waitForVisibility === "function") {
+        await waitForVisibility();
+      }
 
       await sleep(DOM_LONG_WAIT_POLL_MS);
+      if (typeof waitForVisibility === "function") {
+        await waitForVisibility();
+      }
+      if (typeof assertContextStable === "function") {
+        assertContextStable();
+      }
       collectNow();
 
       const messageCount = (collected instanceof Map && collected.size > 0) ? collected.size : countDomMessages();
@@ -4920,7 +6499,7 @@ ${eventRows}
 
       if (!loadingActive && (now - lastLoadingSignalAt) >= DOM_LONG_WAIT_NO_ACTIVITY_EXIT_MS) {
         progressCallback(
-          "DOM fallback: no further loading detected (" + stageLabel + "), continuing...",
+          "No more messages are loading (" + stageLabel + "). Continuing...",
           "busy"
         );
         return false;
@@ -4928,7 +6507,7 @@ ${eventRows}
 
       if ((now - lastPulseAt) >= 6000) {
         progressCallback(
-          "DOM fallback: waiting for very slow loading (" + stageLabel + ", " + passLabel + ")...",
+          "Waiting for more messages to load (" + stageLabel + ", " + passLabel + ")...",
           "busy"
         );
         lastPulseAt = now;
@@ -4936,7 +6515,7 @@ ${eventRows}
 
       if ((now - lastNoGrowthNoticeAt) >= DOM_LONG_WAIT_IDLE_MS) {
         progressCallback(
-          "DOM fallback: still no new elements (" + stageLabel + "), waiting...",
+          "Still waiting for more messages (" + stageLabel + ")...",
           "busy"
         );
         lastNoGrowthNoticeAt = now;
@@ -4947,6 +6526,251 @@ ${eventRows}
     }
 
     return false;
+  }
+
+  async function waitForSingleExportVisibility({
+    progressCallback,
+    isCancelled,
+    routeGuard
+  }) {
+    if (typeof document === "undefined" || document.visibilityState !== "hidden") {
+      return true;
+    }
+
+    const startedAt = Date.now();
+    let lastNoticeAt = 0;
+
+    while (document.visibilityState === "hidden") {
+      if (typeof isCancelled === "function" && isCancelled()) {
+        throw createExportCancelledError();
+      }
+      assertSingleExportRouteGuard(routeGuard);
+
+      const now = Date.now();
+      if ((now - startedAt) >= SINGLE_HIDDEN_WAIT_MAX_MS) {
+        throw createSingleExportHiddenTimeoutError();
+      }
+
+      if ((now - lastNoticeAt) >= SINGLE_HIDDEN_NOTICE_MS) {
+        if (typeof progressCallback === "function") {
+          progressCallback(
+            "Keep this ChatGPT tab visible while this chat is being saved...",
+            "busy"
+          );
+        }
+        lastNoticeAt = now;
+      }
+
+      await sleep(1000);
+    }
+
+    assertSingleExportRouteGuard(routeGuard);
+    return true;
+  }
+
+  async function ensureSingleExportThreadStable(progressCallback, options = {}) {
+    const routeGuard = options?.routeGuard || null;
+    const isCancelled = typeof options?.isCancelled === "function" ? options.isCancelled : () => false;
+    const expectedSignature = String(options?.expectedSignature || "").trim();
+    const scroller = findConversationScroller();
+    const startedAt = Date.now();
+    let stablePasses = 0;
+    let lastSignature = "";
+    let lastNoticeAt = 0;
+
+    while ((Date.now() - startedAt) < SINGLE_EXPORT_STABILITY_WAIT_MAX_MS) {
+      if (isCancelled()) {
+        throw createExportCancelledError();
+      }
+      await waitForSingleExportVisibility({
+        progressCallback,
+        isCancelled,
+        routeGuard
+      });
+      assertSingleExportRouteGuard(routeGuard);
+
+      const loadingActive = hasActiveThreadLoadingIndicators(scroller);
+      const signature = buildCurrentThreadStabilitySignature(scroller);
+      if (expectedSignature) {
+        if (!loadingActive && signature && signature !== expectedSignature) {
+          throw createExportIntegrityError(
+            "The chat changed after it was read and must be collected again.",
+            "export_integrity_snapshot_changed"
+          );
+        }
+
+        if (!loadingActive && signature && signature === expectedSignature) {
+          stablePasses = (signature === lastSignature) ? (stablePasses + 1) : 1;
+          lastSignature = signature;
+          if (stablePasses >= SINGLE_EXPORT_STABILITY_STABLE_PASSES) {
+            return true;
+          }
+        } else {
+          stablePasses = 0;
+          lastSignature = signature;
+        }
+      } else {
+        if (!loadingActive && signature && signature === lastSignature) {
+          stablePasses += 1;
+          if (stablePasses >= SINGLE_EXPORT_STABILITY_STABLE_PASSES) {
+            return true;
+          }
+        } else {
+          stablePasses = (!loadingActive && signature) ? 1 : 0;
+          lastSignature = signature;
+        }
+      }
+
+      const now = Date.now();
+      if (loadingActive && typeof progressCallback === "function" && (now - lastNoticeAt) >= 5000) {
+        progressCallback("Waiting for ChatGPT to finish loading before saving...", "busy");
+        lastNoticeAt = now;
+      }
+
+      await sleep(SINGLE_EXPORT_STABILITY_POLL_MS);
+    }
+
+    throw createExportIntegrityError(
+      "The chat kept changing and could not be verified as stable.",
+      "export_integrity_thread_unstable"
+    );
+  }
+
+  function buildCurrentThreadStabilitySignature(scroller) {
+    void scroller;
+    const turns = document.querySelectorAll("article[data-testid^='conversation-turn-'], article[data-turn-id]");
+    const collected = new Map();
+
+    turns.forEach((turn, turnIndex) => {
+      const messageNodes = turn.querySelectorAll("[data-message-author-role]");
+      const turnMessageIds = [];
+
+      messageNodes.forEach((messageNode, localIndex) => {
+        const messageId = getDomMessageId(messageNode, turn, "dom-" + turnIndex + "-" + localIndex);
+        const role = normalizeRole(messageNode.getAttribute("data-message-author-role") || turn.getAttribute("data-turn") || "");
+        const text = extractDomMessageText(messageNode);
+        const richHtml = extractDomMessageRichHtml(messageNode);
+        const bodyHtml = richHtml || renderMarkdownLite(text || "");
+        const timeElement = messageNode.querySelector("time") || turn.querySelector("time");
+        const timestamp = normalizeTimestamp(timeElement?.getAttribute("datetime") || timeElement?.textContent || "");
+        const timestampInfo = timestamp
+          ? {
+            iso: timestamp.toISOString(),
+            display: formatTimestamp(timestamp)
+          }
+          : null;
+
+        if (!hasMeaningfulMessageCandidate(text, bodyHtml)) {
+          return;
+        }
+
+        const existing = collected.get(messageId);
+        if (existing) {
+          collected.set(messageId, {
+            ...existing,
+            text: chooseLongerText(existing.text, text),
+            bodyHtml: choosePreferredBodyHtml(existing.bodyHtml, bodyHtml),
+            timestampIso: existing.timestampIso || timestampInfo?.iso || "",
+            timestampDisplay: existing.timestampIso ? existing.timestampDisplay : (timestampInfo?.display || "Unknown time")
+          });
+          turnMessageIds.push(messageId);
+          return;
+        }
+
+        collected.set(messageId, {
+          id: messageId,
+          role,
+          text: text || "",
+          bodyHtml,
+          timestampIso: timestampInfo?.iso || "",
+          timestampDisplay: timestampInfo?.display || "Unknown time"
+        });
+        turnMessageIds.push(messageId);
+      });
+
+      const turnImageHtml = extractTurnLevelImagesHtml(turn, messageNodes);
+      if (!turnImageHtml) {
+        return;
+      }
+
+      const targetMessageId = chooseTurnImageTargetMessageId(turnMessageIds, collected);
+      if (targetMessageId && collected.has(targetMessageId)) {
+        const current = collected.get(targetMessageId);
+        const mergedBodyHtml = mergeBodyHtmlWithExtraImages(current.bodyHtml, turnImageHtml);
+        if (mergedBodyHtml !== current.bodyHtml) {
+          collected.set(targetMessageId, {
+            ...current,
+            bodyHtml: mergedBodyHtml
+          });
+        }
+        return;
+      }
+
+      const syntheticId = String(turn.getAttribute("data-turn-id") || ("dom-turn-" + turnIndex)).trim() + "-img";
+      if (!collected.has(syntheticId)) {
+        const timeElement = turn.querySelector("time");
+        const timestamp = normalizeTimestamp(timeElement?.getAttribute("datetime") || timeElement?.textContent || "");
+        collected.set(syntheticId, {
+          id: syntheticId,
+          role: normalizeRole(turn.getAttribute("data-turn") || "assistant"),
+          text: "[Image]",
+          bodyHtml: turnImageHtml,
+          timestampIso: timestamp ? timestamp.toISOString() : "",
+          timestampDisplay: timestamp ? formatTimestamp(timestamp) : "Unknown time"
+        });
+      }
+    });
+
+    return buildMessageContentStabilitySignature(collected.size, Array.from(collected.values()));
+  }
+
+  function buildMessageCollectionStabilitySignature(messages) {
+    if (!Array.isArray(messages) || messages.length <= 0) {
+      return "";
+    }
+
+    const records = messages.map((message, index) => ({
+      id: String(message?.id || ("msg-" + index)).trim(),
+      role: normalizeRole(message?.role || ""),
+      text: String(message?.text || ""),
+      bodyHtml: String(message?.bodyHtml || "")
+    }));
+    return buildMessageContentStabilitySignature(messages.length, records);
+  }
+
+  function buildMessageContentStabilitySignature(totalCount, records) {
+    const list = Array.isArray(records) ? records : [];
+    let aggregateHash = 2166136261;
+    list.forEach((record, index) => {
+      const id = String(record?.id || ("msg-" + index)).trim() || ("msg-" + index);
+      const role = normalizeRole(record?.role || "");
+      const textHash = computeStableContentHash(record?.text || "");
+      const bodyHash = computeStableContentHash(record?.bodyHtml || "");
+      aggregateHash = computeStableContentHashNumber(
+        id + ":" + role + ":" + textHash + ":" + bodyHash,
+        aggregateHash
+      );
+    });
+    return String(Math.max(0, Number(totalCount) || 0)) + "|" + (aggregateHash >>> 0).toString(16).padStart(8, "0");
+  }
+
+  function computeStableContentHash(value) {
+    return computeStableContentHashNumber(value).toString(16).padStart(8, "0");
+  }
+
+  function computeStableContentHashNumber(value, seed = 2166136261) {
+    const text = String(value || "");
+    let hash = Number(seed) >>> 0;
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash +=
+        (hash << 1) +
+        (hash << 4) +
+        (hash << 7) +
+        (hash << 8) +
+        (hash << 24);
+    }
+    return hash >>> 0;
   }
 
   function countDomMessages() {
@@ -5131,7 +6955,7 @@ ${eventRows}
     if (Number.isFinite(bestMs)) {
       return new Date(bestMs);
     }
-    return new Date();
+    return null;
   }
 
   function isPlausibleThreadTimestamp(ms) {
@@ -5293,7 +7117,7 @@ ${eventRows}
         return;
       }
 
-      if (img.closest("button, [role='button'], [aria-hidden='true']")) {
+      if (img.closest("[aria-hidden='true']")) {
         return;
       }
 
@@ -5756,10 +7580,14 @@ ${eventRows}
       return raw;
     }
 
+    if (/^blob:/i.test(raw)) {
+      return raw;
+    }
+
     try {
       const parsed = new URL(raw, window.location.origin);
       const protocol = String(parsed.protocol || "").toLowerCase();
-      if (protocol === "http:" || protocol === "https:") {
+      if (protocol === "http:" || protocol === "https:" || protocol === "blob:") {
         return parsed.href;
       }
       return "";
@@ -6143,6 +7971,603 @@ ${eventRows}
 
   function escapeRegex(value) {
     return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  async function buildSingleExportArtifact({
+    format,
+    detailedMetadata = false,
+    title,
+    source,
+    messages,
+    exportedAt,
+    threadStartedAt,
+    pageUrl,
+    htmlContext = {}
+  }) {
+    const exportFormat = normalizeSingleExportFormat(format);
+    const useDetailedMetadata = normalizeDetailedMetadataOption(detailedMetadata, exportFormat);
+    const baseMessages = Array.isArray(messages) ? messages : [];
+
+    if (exportFormat === "txt") {
+      return {
+        format: "txt",
+        label: "TXT",
+        content: buildPlainTextDocument({
+          detailedMetadata: useDetailedMetadata,
+          title,
+          source,
+          messages: baseMessages,
+          exportedAt,
+          threadStartedAt,
+          pageUrl
+        }),
+        fileName: buildFileName(title, threadStartedAt, "txt"),
+        mimeType: "text/plain;charset=utf-8",
+        messageCount: baseMessages.length
+      };
+    }
+
+    if (exportFormat === "md") {
+      return {
+        format: "md",
+        label: "MD",
+        content: buildMarkdownDocument({
+          detailedMetadata: useDetailedMetadata,
+          title,
+          source,
+          messages: baseMessages,
+          exportedAt,
+          threadStartedAt,
+          pageUrl
+        }),
+        fileName: buildFileName(title, threadStartedAt, "md"),
+        mimeType: "text/markdown;charset=utf-8",
+        messageCount: baseMessages.length
+      };
+    }
+
+    const preparedMessages = await prepareMessagesForHtmlExport(baseMessages, htmlContext);
+    assertExportableConversationMessages(preparedMessages);
+    return {
+      format: "html",
+      label: "HTML",
+      content: buildHtmlDocument({
+        title,
+        source,
+        messages: preparedMessages,
+        exportedAt,
+        threadStartedAt,
+        pageUrl
+      }),
+      fileName: buildFileName(title, threadStartedAt, "html"),
+      mimeType: "text/html;charset=utf-8",
+      messageCount: preparedMessages.length
+    };
+  }
+
+  function buildPlainTextDocument({ title, source, messages, exportedAt, threadStartedAt, pageUrl, detailedMetadata = false }) {
+    if (!normalizeDetailedMetadataOption(detailedMetadata, "txt")) {
+      return buildSimplePlainTextDocument({ title, messages, exportedAt, threadStartedAt, pageUrl });
+    }
+
+    return buildDetailedPlainTextDocument({ title, source, messages, exportedAt, threadStartedAt, pageUrl });
+  }
+
+  function buildSimplePlainTextDocument({ title, messages, exportedAt, threadStartedAt, pageUrl }) {
+    const list = Array.isArray(messages) ? messages : [];
+    const visibleTitle = normalizeStructuredMetadataValue(title || "ChatGPT Export");
+    const lines = [
+      visibleTitle,
+      ""
+    ];
+
+    lines.push(...buildSimpleConversationOverviewLines({
+      messages: list,
+      exportedAt,
+      threadStartedAt,
+      pageUrl,
+      markdownList: true
+    }));
+
+    list.forEach((message, index) => {
+      lines.push("");
+      lines.push(...buildSimplePlainTextMessageLines(message, index));
+    });
+
+    return lines.join("\n").trimEnd() + "\n";
+  }
+
+  function buildDetailedPlainTextDocument({ title, source, messages, exportedAt, threadStartedAt, pageUrl }) {
+    const list = Array.isArray(messages) ? messages : [];
+    const exportId = createStructuredExportId(exportedAt);
+    const lines = [
+      "ChatGPT Export",
+      ""
+    ];
+
+    lines.push(...buildStructuredExportHeaderLines({
+      format: "txt",
+      exportId,
+      title,
+      source,
+      exportedAt,
+      threadStartedAt,
+      pageUrl,
+      messageCount: list.length
+    }));
+
+    list.forEach((message, index) => {
+      lines.push("");
+      lines.push(buildPlainTextMessageBlock(message, index, exportId));
+    });
+
+    return lines.join("\n").trimEnd() + "\n";
+  }
+
+  function buildPlainTextMessageBlock(message, index, exportId) {
+    const markerBase = buildExportMessageMarker(index, exportId);
+    const content = normalizeStructuredContentValue(buildMessageExportText(message));
+    const contentMetrics = getStructuredContentMetrics(content);
+    const imageSources = extractMessageImageSources(message);
+    const lines = [
+      "<<<" + markerBase + "_BEGIN>>>",
+      "Index: " + (index + 1),
+      "Message-ID: " + normalizeStructuredMetadataValue(message?.id || ""),
+      "Role: " + normalizeStructuredMetadataValue(message?.role || "unknown"),
+      "From: " + normalizeStructuredMetadataValue(message?.label || roleLabel(normalizeRole(message?.role || ""))),
+      "Timestamp-ISO: " + normalizeStructuredMetadataValue(message?.timestampIso || "unknown"),
+      "Timestamp-Display: " + normalizeStructuredMetadataValue(message?.timestampDisplay || "Unknown time"),
+      "Image-Count: " + imageSources.length
+    ];
+
+    if (imageSources.length > 0) {
+      lines.push("Image-URLs:");
+      imageSources.forEach((src, imageIndex) => {
+        lines.push((imageIndex + 1) + ". " + src);
+      });
+    }
+
+    lines.push("Content-Char-Length: " + contentMetrics.charLength);
+    lines.push("Content-Byte-Length: " + contentMetrics.byteLength);
+    lines.push("Content-Encoding: raw-utf8");
+    lines.push("Content:");
+    const prefix = lines.join("\n");
+    return prefix + "\n" + content + "\n<<<" + markerBase + "_END>>>";
+  }
+
+  function buildSimplePlainTextMessageLines(message, index) {
+    const label = normalizeStructuredMetadataValue(
+      message?.label || roleLabel(normalizeRole(message?.role || "")) || ("Message " + (index + 1))
+    );
+    const { dateLabel, timeLabel } = resolveSimpleMessageTimestampLabels(message);
+    const content = normalizeStructuredContentValue(buildMessageExportText(message));
+    const imageSources = extractMessageImageSources(message);
+    const lines = [
+      label,
+      "Date: " + dateLabel,
+      "Time: " + timeLabel,
+      ""
+    ];
+
+    if (content) {
+      lines.push(content);
+    } else if (imageSources.length > 0) {
+      lines.push("[No text content. See image links below.]");
+    } else {
+      lines.push("[No text content]");
+    }
+
+    if (imageSources.length > 0) {
+      lines.push("");
+      lines.push("Images:");
+      imageSources.forEach((src) => {
+        lines.push("- " + src);
+      });
+    }
+
+    return lines;
+  }
+
+  function buildMarkdownDocument({ title, source, messages, exportedAt, threadStartedAt, pageUrl, detailedMetadata = false }) {
+    if (normalizeDetailedMetadataOption(detailedMetadata, "md")) {
+      return buildDetailedMarkdownDocument({ title, source, messages, exportedAt, threadStartedAt, pageUrl });
+    }
+
+    return buildSimpleMarkdownDocument({ title, source, messages, exportedAt, threadStartedAt, pageUrl });
+  }
+
+  function buildSimpleMarkdownDocument({ title, source, messages, exportedAt, threadStartedAt, pageUrl }) {
+    const list = Array.isArray(messages) ? messages : [];
+    const visibleTitle = normalizeStructuredMetadataValue(title || "ChatGPT Export");
+    const lines = [
+      "# " + visibleTitle,
+      ""
+    ];
+
+    lines.push(...buildSimpleConversationOverviewLines({
+      messages: list,
+      exportedAt,
+      threadStartedAt,
+      pageUrl,
+      markdownList: true
+    }));
+
+    list.forEach((message, index) => {
+      lines.push("");
+      lines.push(...buildSimpleMarkdownMessageBlockLines(message, index));
+    });
+
+    return lines.join("\n").trimEnd() + "\n";
+  }
+
+  function buildDetailedMarkdownDocument({ title, source, messages, exportedAt, threadStartedAt, pageUrl }) {
+    const list = Array.isArray(messages) ? messages : [];
+    const exportId = createStructuredExportId(exportedAt);
+    const lines = [
+      "# ChatGPT Export",
+      ""
+    ];
+
+    lines.push(...buildStructuredExportHeaderLines({
+      format: "md",
+      parserContract: "markdown-fence-plus-byte-length",
+      exportId,
+      title,
+      source,
+      exportedAt,
+      threadStartedAt,
+      pageUrl,
+      messageCount: list.length,
+      markdownList: true
+    }));
+
+    list.forEach((message, index) => {
+      lines.push("");
+      lines.push(...buildDetailedMarkdownMessageBlockLines(message, index, exportId));
+    });
+
+    return lines.join("\n").trimEnd() + "\n";
+  }
+
+  function buildDetailedMarkdownMessageBlockLines(message, index, exportId) {
+    const markerBase = buildExportMessageMarker(index, exportId);
+    const content = normalizeStructuredContentValue(buildMessageExportText(message));
+    const contentMetrics = getStructuredContentMetrics(content);
+    const imageSources = extractMessageImageSources(message);
+    const contentFence = buildMarkdownCodeFenceDescriptor(content, "text");
+    const lines = [
+      "<!-- " + markerBase + "_BEGIN -->",
+      "## Message " + (index + 1),
+      "",
+      "- Message-ID: " + normalizeStructuredMetadataValue(message?.id || ""),
+      "- Role: " + normalizeStructuredMetadataValue(message?.role || "unknown"),
+      "- From: " + normalizeStructuredMetadataValue(message?.label || roleLabel(normalizeRole(message?.role || ""))),
+      "- Timestamp-ISO: " + normalizeStructuredMetadataValue(message?.timestampIso || "unknown"),
+      "- Timestamp-Display: " + normalizeStructuredMetadataValue(message?.timestampDisplay || "Unknown time"),
+      "- Image-Count: " + imageSources.length,
+      "- Content-Char-Length: " + contentMetrics.charLength,
+      "- Content-Byte-Length: " + contentMetrics.byteLength,
+      "- Content-Encoding: raw-utf8",
+      "- Content-Fence: " + contentFence.fence
+    ];
+
+    if (imageSources.length > 0) {
+      lines.push("");
+      lines.push("### Images");
+      lines.push("");
+      imageSources.forEach((src) => {
+        lines.push("- " + src);
+      });
+    }
+
+    lines.push("");
+    lines.push("### Content");
+    lines.push("");
+    lines.push(contentFence.block);
+    lines.push("");
+    lines.push("<!-- " + markerBase + "_END -->");
+    return lines;
+  }
+
+  function buildSimpleMarkdownMessageBlockLines(message, index) {
+    const content = normalizeStructuredContentValue(buildMessageExportText(message));
+    const imageSources = extractMessageImageSources(message);
+    const visibleLabel = normalizeStructuredMetadataValue(
+      message?.label || roleLabel(normalizeRole(message?.role || "")) || ("Message " + (index + 1))
+    );
+    const { dateLabel, timeLabel } = resolveSimpleMessageTimestampLabels(message);
+    const contentFence = buildMarkdownCodeFenceDescriptor(content, "text");
+    const lines = [
+      "## " + visibleLabel,
+      "",
+      "- Date: " + dateLabel,
+      "- Time: " + timeLabel,
+      "",
+      "### Message",
+      ""
+    ];
+
+    if (content) {
+      lines.push(contentFence.block);
+    } else if (imageSources.length > 0) {
+      lines.push("_No text content. See images below._");
+    } else {
+      lines.push("_No text content._");
+    }
+
+    if (imageSources.length > 0) {
+      lines.push("");
+      lines.push("### Images");
+      lines.push("");
+      imageSources.forEach((src) => {
+        lines.push("- " + src);
+      });
+    }
+
+    return lines;
+  }
+
+  function buildSimpleConversationOverviewLines({ messages, exportedAt, threadStartedAt, pageUrl, markdownList = false }) {
+    const list = Array.isArray(messages) ? messages : [];
+    const conversationLabels = resolveSimpleTimestampLabels(threadStartedAt);
+    const exportedLabels = resolveSimpleTimestampLabels(exportedAt);
+    const prefix = markdownList ? "- " : "";
+    const lines = [
+      prefix + "Conversation date: " + conversationLabels.dateLabel,
+      prefix + "Conversation time: " + conversationLabels.timeLabel,
+      prefix + "Exported date: " + exportedLabels.dateLabel,
+      prefix + "Exported time: " + exportedLabels.timeLabel,
+      prefix + "Messages: " + list.length
+    ];
+
+    if (pageUrl) {
+      lines.push(prefix + "Chat link: " + String(pageUrl).trim());
+    }
+
+    return lines;
+  }
+
+  function resolveSimpleMessageTimestampLabels(message) {
+    return resolveSimpleTimestampLabels(
+      message?.timestampIso
+      || message?.timestamp
+      || message?.create_time
+      || message?.createTime
+      || message?.update_time
+      || message?.updateTime,
+      message?.timestampDisplay
+    );
+  }
+
+  function resolveSimpleTimestampLabels(value, fallbackDisplay = "") {
+    const normalizedDate = normalizeTimestamp(value);
+    if (normalizedDate) {
+      return {
+        dateLabel: formatSimpleDate(normalizedDate),
+        timeLabel: formatSimpleTime(normalizedDate)
+      };
+    }
+
+    const fallback = normalizeStructuredMetadataValue(fallbackDisplay || "");
+    if (fallback && fallback !== "-" && fallback !== "Unknown time") {
+      return {
+        dateLabel: "Unknown date",
+        timeLabel: fallback
+      };
+    }
+
+    return {
+      dateLabel: "Unknown date",
+      timeLabel: "Unknown time"
+    };
+  }
+
+  function formatSimpleDate(date) {
+    if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
+      return "Unknown date";
+    }
+    return String(date.getFullYear())
+      + "-"
+      + String(date.getMonth() + 1).padStart(2, "0")
+      + "-"
+      + String(date.getDate()).padStart(2, "0");
+  }
+
+  function formatSimpleTime(date) {
+    if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
+      return "Unknown time";
+    }
+    return String(date.getHours()).padStart(2, "0")
+      + ":"
+      + String(date.getMinutes()).padStart(2, "0")
+      + ":"
+      + String(date.getSeconds()).padStart(2, "0");
+  }
+
+  function buildStructuredExportHeaderLines({
+    format,
+    parserContract = "",
+    exportId,
+    title,
+    source,
+    exportedAt,
+    threadStartedAt,
+    pageUrl,
+    messageCount,
+    markdownList = false
+  }) {
+    const lines = [];
+    const prefix = markdownList ? "- " : "";
+    const startedAt = threadStartedAt instanceof Date && !Number.isNaN(threadStartedAt.getTime())
+      ? threadStartedAt
+      : null;
+    const normalizedFormat = normalizeStructuredMetadataValue(format || "html");
+
+    lines.push(prefix + "Export-Version: 2");
+    lines.push(prefix + "Export-Format: " + normalizedFormat);
+    lines.push(prefix + "Export-ID: " + normalizeStructuredMetadataValue(exportId || ""));
+    lines.push(prefix + "Title: " + normalizeStructuredMetadataValue(title || "ChatGPT Dialog"));
+    lines.push(prefix + "Source: " + normalizeStructuredMetadataValue(source || "dom"));
+    lines.push(prefix + "Page-URL: " + normalizeStructuredMetadataValue(pageUrl || ""));
+    lines.push(prefix + "Exported-At-ISO: " + normalizeStructuredMetadataValue(exportedAt?.toISOString?.() || ""));
+    lines.push(prefix + "Exported-At-Display: " + normalizeStructuredMetadataValue(formatTimestamp(exportedAt)));
+    lines.push(prefix + "Thread-Started-At-ISO: " + normalizeStructuredMetadataValue(startedAt ? startedAt.toISOString() : "unknown"));
+    lines.push(prefix + "Thread-Started-At-Display: " + normalizeStructuredMetadataValue(startedAt ? formatTimestamp(startedAt) : "Unknown time"));
+    lines.push(prefix + "Text-Encoding: utf-8");
+    lines.push(prefix + "Line-Endings: lf");
+    if (parserContract) {
+      lines.push(prefix + "Parser-Contract: " + normalizeStructuredMetadataValue(parserContract));
+    } else if (normalizedFormat === "txt") {
+      lines.push(prefix + "Parser-Contract: raw-content-byte-length");
+    } else if (normalizedFormat === "md") {
+      lines.push(prefix + "Parser-Contract: markdown-comment-metadata-plus-content-markers");
+    }
+    lines.push(prefix + "Message-Count: " + Math.max(0, Number(messageCount) || 0));
+
+    return lines;
+  }
+
+  function buildExportMessageMarker(index, exportId = "") {
+    const exportPart = sanitizeStructuredExportId(exportId);
+    const exportPrefix = exportPart ? exportPart + "_" : "";
+    return "CHATGPT_EXPORT_" + exportPrefix + "MESSAGE_" + String(index + 1).padStart(4, "0");
+  }
+
+  function buildMessageExportText(message) {
+    const directText = normalizeExportTextContent(message?.text || "");
+    if (directText) {
+      return directText;
+    }
+
+    const bodyText = extractPlainTextFromExportHtml(resolveMessageBodyHtml(message));
+    if (bodyText) {
+      return bodyText;
+    }
+
+    const imageSources = extractMessageImageSources(message);
+    if (imageSources.length > 0) {
+      return "[No text content. See image list above.]";
+    }
+
+    return "";
+  }
+
+  function extractPlainTextFromExportHtml(rawHtml) {
+    const source = String(rawHtml || "").trim();
+    if (!source) {
+      return "";
+    }
+
+    const template = document.createElement("template");
+    template.innerHTML = source;
+    return normalizeExportTextContent(template.content.textContent || "");
+  }
+
+  function extractMessageImageSources(message) {
+    return extractImageSourcesFromHtml(resolveMessageBodyHtml(message));
+  }
+
+  function normalizeExportTextContent(value) {
+    return String(value || "")
+      .replace(/\r\n?/g, "\n")
+      .trim();
+  }
+
+  function normalizeStructuredContentValue(value) {
+    return String(value || "").replace(/\r\n?/g, "\n");
+  }
+
+  function buildMarkdownVisibleContentLines(content, hasImages = false) {
+    const normalized = normalizeStructuredContentValue(content);
+    if (!normalized) {
+      return [hasImages ? "_No text content. See images below._" : "_No text content._"];
+    }
+    return normalized.split("\n");
+  }
+
+  function buildSimpleTimestampSuffix(timestampLabel) {
+    const normalized = normalizeStructuredMetadataValue(timestampLabel || "");
+    if (!normalized || normalized === "-" || normalized === "Unknown time") {
+      return "";
+    }
+    return " (" + normalized + ")";
+  }
+
+  function getStructuredContentMetrics(content) {
+    const normalizedContent = normalizeStructuredContentValue(content);
+    return {
+      charLength: normalizedContent.length,
+      byteLength: getUtf8ByteLength(normalizedContent)
+    };
+  }
+
+  function getUtf8ByteLength(value) {
+    return new TextEncoder().encode(String(value || "")).length;
+  }
+
+  function normalizeStructuredMetadataValue(value) {
+    return String(value || "")
+      .replace(/\r\n?/g, " ")
+      .replace(/\s+/g, " ")
+      .trim() || "-";
+  }
+
+  function buildMarkdownCodeFenceDescriptor(content, infoString = "") {
+    const body = String(content || "").replace(/\r\n?/g, "\n");
+    const matches = body.match(/`{3,}/g) || [];
+    const longestFence = matches.reduce((max, token) => Math.max(max, token.length), 2);
+    const fence = "`".repeat(longestFence + 1);
+    const info = String(infoString || "").trim();
+    return {
+      fence,
+      block: fence + (info ? info : "") + "\n" + body + "\n" + fence
+    };
+  }
+
+  function createStructuredExportId(exportedAt) {
+    const iso = exportedAt instanceof Date && !Number.isNaN(exportedAt.getTime())
+      ? exportedAt.toISOString()
+      : new Date().toISOString();
+    const compactIso = iso
+      .replace(/[-:]/g, "")
+      .replace(/\.\d{3}Z$/, "Z");
+    const randomPart = Math.random().toString(36).slice(2, 8).toUpperCase();
+    return compactIso + "_" + randomPart;
+  }
+
+  function sanitizeStructuredExportId(value) {
+    return String(value || "")
+      .toUpperCase()
+      .replace(/[^A-Z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 48);
+  }
+
+  function normalizeSingleExportFormat(value) {
+    const normalized = String(value || "").trim().toLowerCase();
+    if (normalized === "txt" || normalized === "md") {
+      return normalized;
+    }
+    return "html";
+  }
+
+  function normalizeDetailedMetadataOption(value, format = "html") {
+    const normalizedFormat = normalizeSingleExportFormat(format);
+    if (normalizedFormat === "html") {
+      return false;
+    }
+    return Boolean(value);
+  }
+
+  function getSingleExportFormatLabel(format) {
+    const normalized = normalizeSingleExportFormat(format);
+    if (normalized === "txt") {
+      return "TXT";
+    }
+    if (normalized === "md") {
+      return "MD";
+    }
+    return "HTML";
   }
 
   function buildHtmlDocument({ title, source, messages, exportedAt, threadStartedAt, pageUrl }) {
@@ -7294,20 +9719,16 @@ ${items}
 </html>`;
   }
 
-  async function triggerBrowserDownload(html, filename, options = {}) {
-    const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+  async function triggerBrowserDownload(content, filename, options = {}) {
+    const mimeType = normalizeDownloadMimeType(options?.mimeType || "text/html;charset=utf-8");
+    const blob = new Blob([content], { type: mimeType });
     const safeFilename = String(filename || "chatgpt_dialog.html");
-    const downloadFilename = buildDownloadFilenameWithSubdirectory(safeFilename, options?.subdirectory || "");
+    const downloadFilename = buildDownloadFilenameWithSubdirectory(
+      safeFilename,
+      options?.subdirectory || "",
+      getDefaultExtensionForMimeType(mimeType)
+    );
     const conflictAction = normalizeDownloadConflictAction(options?.conflictAction);
-
-    try {
-      const runtimeDownload = await triggerDownloadViaRuntime(html, downloadFilename, conflictAction);
-      if (runtimeDownload && runtimeDownload.ok) {
-        return;
-      }
-    } catch (error) {
-      console.warn("[ChatGPT Export] Runtime download failed, trying direct API:", error);
-    }
 
     if (chrome?.downloads?.download) {
       const extensionUrl = URL.createObjectURL(blob);
@@ -7336,7 +9757,7 @@ ${items}
         });
         return;
       } catch (error) {
-        console.warn("[ChatGPT Export] downloads API failed, fallback to anchor:", error);
+        console.warn("[ChatGPT Export] downloads API failed, trying runtime/anchor fallbacks:", error);
       } finally {
         setTimeout(() => {
           URL.revokeObjectURL(extensionUrl);
@@ -7344,10 +9765,19 @@ ${items}
       }
     }
 
+    try {
+      const runtimeDownload = await triggerDownloadViaRuntime(content, downloadFilename, conflictAction, mimeType);
+      if (runtimeDownload && runtimeDownload.ok) {
+        return;
+      }
+    } catch (error) {
+      console.warn("[ChatGPT Export] Runtime download failed, trying anchor fallback:", error);
+    }
+
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = safeFilename;
+    anchor.download = downloadFilename;
     anchor.rel = "noopener";
     anchor.style.display = "none";
 
@@ -7360,15 +9790,16 @@ ${items}
     }, 30000);
   }
 
-  async function triggerDownloadViaRuntime(html, filename, conflictAction) {
+  async function triggerDownloadViaRuntime(content, filename, conflictAction, mimeType) {
     if (!chrome?.runtime?.sendMessage) {
       throw new Error("runtime messaging not available");
     }
 
     const payload = {
       type: "chatgpt-export-download",
-      html: String(html || ""),
+      content: String(content || ""),
       filename: String(filename || "chatgpt_dialog.html"),
+      mimeType: normalizeDownloadMimeType(mimeType),
       conflictAction: normalizeDownloadConflictAction(conflictAction)
     };
 
@@ -7396,18 +9827,40 @@ ${items}
     return "uniquify";
   }
 
-  function buildFileName(title, date) {
-    const safeTitle = sanitizeForFileName(title || "chatgpt_dialog");
-    const datePart = formatDateForFileName(date);
-    return safeTitle + "_" + datePart + ".html";
+  function normalizeDownloadMimeType(value) {
+    const normalized = String(value || "").trim().toLowerCase();
+    if (!normalized) {
+      return "text/plain;charset=utf-8";
+    }
+    if (/;\s*charset=/i.test(normalized)) {
+      return normalized;
+    }
+    return normalized + ";charset=utf-8";
   }
 
-  function buildBatchFileName(title, timestamp, index, totalCount) {
+  function getDefaultExtensionForMimeType(mimeType) {
+    const normalized = normalizeDownloadMimeType(mimeType);
+    if (normalized.startsWith("text/markdown")) {
+      return "md";
+    }
+    if (normalized.startsWith("text/plain")) {
+      return "txt";
+    }
+    return "html";
+  }
+
+  function buildFileName(title, date, format = "html") {
+    const safeTitle = sanitizeForFileName(title || "chatgpt_dialog");
+    const datePart = formatDateForFileName(date);
+    return safeTitle + "_" + datePart + "." + getSingleExportFileExtension(format);
+  }
+
+  function buildBatchFileName(title, timestamp, index, totalCount, format = "html") {
     const safeTitle = sanitizeForFileName(title || "chatgpt_dialog");
     const datePart = formatDateForFileName(timestamp || new Date());
     const width = String(Math.max(1, totalCount)).length;
     const ordinal = String(index).padStart(width, "0");
-    return datePart + "_" + ordinal + "_" + safeTitle + ".html";
+    return datePart + "_" + ordinal + "_" + safeTitle + "." + getSingleExportFileExtension(format);
   }
 
   function buildBatchFolderPath({ accountName, yearOnlyFolder, date }) {
@@ -7440,14 +9893,32 @@ ${items}
     return "Unknown_Account";
   }
 
-  function buildDownloadFilenameWithSubdirectory(fileName, subdirectory) {
-    const safeBase = sanitizeForFileName(fileName || "chatgpt_dialog");
-    const safeFile = /\.html?$/i.test(safeBase) ? safeBase : (safeBase + ".html");
+  function buildDownloadFilenameWithSubdirectory(fileName, subdirectory, defaultExtension = "html") {
+    const safeFile = ensureFileNameExtension(fileName || "chatgpt_dialog", defaultExtension);
     const cleanDir = sanitizeDownloadSubdirectory(subdirectory || "");
     if (!cleanDir) {
       return safeFile;
     }
     return cleanDir + "/" + safeFile;
+  }
+
+  function ensureFileNameExtension(fileName, defaultExtension) {
+    const safeBase = sanitizeForFileName(fileName || "chatgpt_dialog");
+    if (/\.[a-z0-9]{1,12}$/i.test(safeBase)) {
+      return safeBase;
+    }
+    return safeBase + "." + getSingleExportFileExtension(defaultExtension || "html");
+  }
+
+  function getSingleExportFileExtension(format) {
+    const normalized = normalizeSingleExportFormat(format);
+    if (normalized === "txt") {
+      return "txt";
+    }
+    if (normalized === "md") {
+      return "md";
+    }
+    return "html";
   }
 
   function sanitizeDownloadSubdirectory(value) {
@@ -7512,12 +9983,15 @@ ${items}
   }
 
   function formatDateForFileName(date) {
-    const year = String(date.getFullYear());
-    const month = String(date.getMonth() + 1).padStart(2, "0");
-    const day = String(date.getDate()).padStart(2, "0");
-    const hours = String(date.getHours()).padStart(2, "0");
-    const minutes = String(date.getMinutes()).padStart(2, "0");
-    const seconds = String(date.getSeconds()).padStart(2, "0");
+    const safeDate = date instanceof Date && !Number.isNaN(date.getTime())
+      ? date
+      : new Date();
+    const year = String(safeDate.getFullYear());
+    const month = String(safeDate.getMonth() + 1).padStart(2, "0");
+    const day = String(safeDate.getDate()).padStart(2, "0");
+    const hours = String(safeDate.getHours()).padStart(2, "0");
+    const minutes = String(safeDate.getMinutes()).padStart(2, "0");
+    const seconds = String(safeDate.getSeconds()).padStart(2, "0");
     return year + "-" + month + "-" + day + "_" + hours + "-" + minutes + "-" + seconds;
   }
 
@@ -7852,11 +10326,11 @@ ${items}
 
       if ((now - lastNoticeAt) >= BATCH_HIDDEN_NOTICE_MS) {
         const doneText = String(completedLabel || "").trim();
-        const batchPart = indexLabel ? ("Batch " + indexLabel + " | ") : "Batch | ";
-        const donePart = doneText ? (doneText + " completed: ") : "";
+        const batchPart = indexLabel ? ("Chat " + indexLabel + ": ") : "";
+        const donePart = doneText ? (doneText + ". ") : "";
         if (typeof progressCallback === "function") {
           progressCallback(
-            batchPart + donePart + "waiting: Keep the ChatGPT tab in the foreground...",
+            batchPart + donePart + "Keep this ChatGPT tab visible...",
             "busy"
           );
         }

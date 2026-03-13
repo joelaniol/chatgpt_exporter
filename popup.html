@@ -3,31 +3,73 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ChatGPT Export</title>
+  <title>Save ChatGPT Chats</title>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
   <main class="popup">
-    <h1>ChatGPT Export</h1>
-    <p id="hint" class="hint">Checking active tab...</p>
+    <header class="hero">
+      <p class="eyebrow">Simple Chat Backup</p>
+      <h1>Save ChatGPT Chats</h1>
+      <p class="intro">Choose what you want to save, choose a file type, then start.</p>
+    </header>
 
-    <label class="toggle top">
-      <input id="yearFolderToggle" type="checkbox">
-      <span>Batch: year folders only</span>
-    </label>
-    <label class="toggle top">
-      <input id="debugLogToggle" type="checkbox">
-      <span>Batch: live debug log (file)</span>
-    </label>
+    <p id="hint" class="hint">Checking this tab...</p>
 
-    <div class="actions">
-      <button id="exportBtn" type="button">Save</button>
-      <button id="batchBtn" type="button" class="secondary">Save Batch</button>
-      <button id="resumeBatchBtn" type="button" class="secondary">Resume Batch</button>
-      <button id="cancelBatchBtn" type="button" class="danger">Stop Export</button>
+    <section class="control-card" aria-label="Save setup">
+      <div class="field-group">
+        <label class="field-label" for="scopeSelect">What do you want to save?</label>
+        <select id="scopeSelect" class="select-field">
+          <option value="single">This Chat</option>
+          <option value="batch">Many Chats</option>
+        </select>
+      </div>
+
+      <div class="field-group">
+        <label class="field-label" for="formatSelect">File type</label>
+        <select id="formatSelect" class="select-field">
+          <option value="html">Web Page (HTML)</option>
+          <option value="txt">Text File (TXT)</option>
+          <option value="md">Markdown (MD)</option>
+        </select>
+      </div>
+
+      <label id="metadataToggleRow" class="toggle top" hidden>
+        <input id="metadataToggle" type="checkbox">
+        <span>Detailed metadata for TXT and Markdown</span>
+      </label>
+
+      <p id="selectionHelp" class="selection-help">Web Page is the easiest option for most people.</p>
+
+      <button id="startBtn" type="button">Start Saving This Chat</button>
+    </section>
+
+    <div id="runActions" class="run-actions" hidden>
+      <button id="resumeBatchBtn" type="button" class="secondary" hidden>Continue Saving</button>
+      <button id="cancelBatchBtn" type="button" class="danger" hidden>Stop Saving</button>
     </div>
 
-    <p class="meta">Batch saves to: Chat GPT/Account/Year/Month (optional year-only). Hold this tab in foreground and do nothing while batch export is running; it can take a long, long time.</p>
+    <section id="batchOptionsPanel" class="batch-panel" hidden>
+      <p class="panel-title">Optional For Many Chats</p>
+      <p class="panel-copy">You only need these settings for larger backups.</p>
+      <label class="toggle top">
+        <input id="yearFolderToggle" type="checkbox">
+        <span>Use one folder per year</span>
+      </label>
+      <label class="toggle">
+        <input id="debugLogToggle" type="checkbox">
+        <span>Save an extra help file during long runs</span>
+      </label>
+    </section>
+
+    <section class="quick-guide">
+      <p class="quick-title">Quick Start</p>
+      <p class="quick-step"><strong>1.</strong> Choose <strong>This Chat</strong> or <strong>Many Chats</strong>.</p>
+      <p class="quick-step"><strong>2.</strong> Choose a file type. <strong>Web Page</strong> is best for most people.</p>
+      <p class="quick-step"><strong>3.</strong> Click the main button to start.</p>
+    </section>
+
+    <p class="meta">Files are saved to your Downloads folder inside a <strong>Chat GPT</strong> folder. While saving many chats, keep this ChatGPT tab open and visible.</p>
   </main>
   <script src="popup.js"></script>
 </body>

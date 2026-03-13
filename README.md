@@ -1,35 +1,36 @@
-# ChatGPT Thread Exporter
+# Save GPT Chats
 
-Chrome extension (Manifest V3) to export ChatGPT conversations as standalone HTML files for backup and offline access.
+Save your ChatGPT chats to your Downloads folder as Web Page (HTML), Text File (TXT), or Markdown (MD).
 
 ## Download
-- Release page: https://github.com/joelaniol/chatgpt_exporter/releases
-- Direct ZIP (v1.4.1): https://github.com/joelaniol/chatgpt_exporter/releases/download/v1.4.1/chatgpt_exporter-v1.4.1.zip
-
-## Build Release ZIP (Local)
-- Run: `powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1`
-- Output: `release/chatgpt_exporter-v<version>.zip`
-- The script uses a strict allowlist and verifies there are no extra files in the ZIP.
+- Release page: https://github.com/joelaniol/save-gpt-chats/releases
+- Direct ZIP (v1.5.1): https://github.com/joelaniol/save-gpt-chats/releases/download/v1.5.1/save-gpt-chats-v1.5.1.zip
 
 ## Features
-- Export the currently open ChatGPT conversation to HTML.
-- Batch export many/all conversations.
-- Continue batch export even if a single conversation fails.
-- Failure summary with reason code, title, conversation ID, and error message.
-- Optional live debug checkpoint file during batch.
-- Full-size image embedding for backup-grade exports.
-- Click-to-open lightbox for images in exported HTML.
+- Save the chat you currently have open.
+- Save many or all chats in one run.
+- Choose HTML for easiest reading, TXT for plain text, or MD for Markdown.
+- Continue a paused multi-chat save later.
+- Optional extra help file for long multi-chat runs.
+- Large images stay included in HTML exports.
+
+## What's New In v1.5.1
+- New export formats: **Text File (TXT)** and **Markdown (MD)** alongside HTML.
+- Optional detailed metadata toggle for TXT and Markdown exports.
+- Simpler, cleaner popup interface.
+- More robust export handling and error recovery.
+- Renamed from ChatGPT Exporter to **Save GPT Chats**.
 
 ## What's New In v1.4.1
-- Fixed: user-uploaded images wrapped inside ChatGPT lightbox buttons are now preserved and embedded in exports.
-- Fixed: `Single Save` no longer leaves newly added messages as `Unknown time` after the thread was already open.
-- Improved: timestamp handling is more robust when ChatGPT does not expose `<time>` nodes for fresh turns.
+- Uploaded images are saved more reliably.
+- Message times stay more accurate in active chats.
+- Overall saving is more reliable when ChatGPT loads slowly.
 
 ## Screenshots
 ![Export Dialog](media/screenshot-chatgpt-export-dialog.png)
 
 ## Promo Image
-![ChatGPT Thread Exporter Promo](media/linkedin-chatgpt-exporter-v1.4.0.png)
+![Save GPT Chats Promo](media/linkedin-chatgpt-exporter-v1.4.0.png)
 
 ## Install (Chrome)
 1. Download the project ZIP from GitHub.
@@ -41,24 +42,33 @@ Chrome extension (Manifest V3) to export ChatGPT conversations as standalone HTM
 
 ## How To Use
 1. Pin the extension in Chrome.
-2. Open a ChatGPT conversation at `https://chatgpt.com/c/...`.
+2. Open ChatGPT.
 3. Refresh the ChatGPT page once after loading the extension.
 4. Open the extension popup.
-5. Use `Save` for a single conversation or `Save Batch` for many conversations.
-6. If paused, use `Resume Batch`.
+5. Use `Save This Chat` for the chat you are viewing.
+6. Use `Save Many Chats` for a larger backup.
+7. If a multi-chat run pauses, use `Continue Saving`.
 
-## Important Batch Rule
-Keep the ChatGPT tab in the foreground while batch export is running.
-- Do not use ChatGPT in a second tab or window during export.
-- Do not switch tabs/windows.
-- Do not scroll or click manually during the run.
-- Large histories can take a long time due to lazy loading.
+## Quick Tip
+- If you are unsure which file type to choose, use `Web Page (HTML)`.
+- It is the easiest version to open and read later.
+
+## File Types
+- `Web Page (HTML)`: Best if you want the export to look close to ChatGPT.
+- `Text File (TXT)`: Best if you want simple plain text.
+- `Markdown (MD)`: Best if you want Markdown.
+
+## When Saving Many Chats
+Keep the ChatGPT tab open and visible while the save is running.
+- Do not switch to another tab or window.
+- Do not scroll or click inside ChatGPT during the run.
+- Large chat libraries can take a while.
 
 ## Output Structure
-- Single export: `Chat GPT/<filename>.html`
-- Batch (default): `Chat GPT/<Account>/<Year>/<Month>/<filename>.html`
-- Batch (year-only mode): `Chat GPT/<Account>/<Year>/<filename>.html`
-- Live debug file (optional): `Chat GPT/<Account>/Batch_Debug_Live_YYYY-MM-DD_HH-mm-ss.html`
+- Single-chat files are saved inside `Downloads/Chat GPT`.
+- Multi-chat files are grouped inside `Downloads/Chat GPT/<Account>/<Year>/<Month>`.
+- If year-only mode is turned on, month folders are skipped.
+- Optional help files are saved inside the same account folder.
 
 ## Privacy
 - Runs locally in your browser.
@@ -66,18 +76,23 @@ Keep the ChatGPT tab in the foreground while batch export is running.
 - No external backend service is used in this repository.
 
 ## Troubleshooting
-- `Unknown_Account` folder:
-  - Reload extension and ChatGPT tab, then start batch again.
-  - Ensure you are logged in and profile/sidebar info is visible.
-- Batch seems to stop too early:
-  - Keep the tab in foreground and wait for lazy-loaded items.
-- One conversation works manually but fails in batch:
-  - Check the failure report (and debug checkpoint, if enabled) for reason codes.
+- Chats are saved into an `Unknown_Account` folder:
+  - Reload the extension and the ChatGPT tab, then try again.
+  - Make sure you are logged in and your sidebar/profile area is visible.
+- A multi-chat run pauses or stops early:
+  - Keep the ChatGPT tab visible and wait for all chats to load.
+- Some chats fail during a large run:
+  - Open the help report or optional help file to see which chats had trouble.
 
 ## Platform Change Notice
-- ChatGPT is a live platform and OpenAI can change UI structure, DOM, routes, or APIs at any time.
-- If that happens, parts of this extension can break until updated.
+- ChatGPT changes over time, and parts of the website can move or behave differently.
+- If that happens, parts of this extension may need an update.
 - If you hit a new breakage, please send me a short LinkedIn message with what failed and (if possible) a screenshot.
+
+## For Developers
+- Build release ZIP locally: `powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1`
+- Output: `release/save-gpt-chats-v<version>.zip`
+- The script uses a strict allowlist and verifies there are no extra files in the ZIP.
 
 ## Contact
 - Joel Aniol: https://www.linkedin.com/in/joelaniol/
